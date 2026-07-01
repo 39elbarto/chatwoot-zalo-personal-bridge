@@ -1,0 +1,22 @@
+[Unit]
+Description=Chatwoot Zalo Personal Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/chatwoot-zalo-personal-bridge
+EnvironmentFile=/opt/chatwoot-zalo-personal-bridge/.env
+ExecStart=/usr/bin/node dist/index.js
+Restart=always
+RestartSec=10
+User=bridge
+Group=bridge
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/chatwoot-zalo-personal-bridge/data
+
+[Install]
+WantedBy=multi-user.target
