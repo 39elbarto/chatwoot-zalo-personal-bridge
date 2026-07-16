@@ -1,5 +1,6 @@
 import axios from "axios";
 import FormData from "form-data";
+import { resolveMediaMetadata } from "./mediaMetadata";
 
 type HttpResult<T = any> = { status: number; body: T; text: string };
 const DEFAULT_FETCH_TIMEOUT_MS = 30_000;
@@ -690,7 +691,7 @@ export class ChatwootClient {
     messageType?: "incoming" | "outgoing";
     isPrivate?: boolean;
   }): Promise<number | null> {
-    const { conversationId, mediaUrl, fileName } = params;
+    const { conversationId, mediaUrl } = params;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 20000);
     try {
@@ -699,9 +700,15 @@ export class ChatwootClient {
         signal: controller.signal as any,
       });
       const buffer = Buffer.from(response.data);
-      const contentType =
-        params.contentTypeHint ||
-        (typeof response.headers["content-type"] === "string" ? (response.headers["content-type"] as string) : undefined);
+      const metadata = resolveMediaMetadata({
+        fileName: params.fileName,
+        mediaUrl,
+        contentTypeHint: params.contentTypeHint,
+        responseContentType:
+          typeof response.headers["content-type"] === "string" ? (response.headers["content-type"] as string) : undefined,
+        buffer,
+        fallbackBase: params.type,
+      });
       const form = new FormData();
       const messageType = params.messageType || "incoming";
       const isPrivate = params.isPrivate ?? false;
@@ -713,7 +720,7 @@ export class ChatwootClient {
         form.append("additional_attributes[msgId]", params.zaloMsgId);
         form.append("additional_attributes[zalo_msg_id]", params.zaloMsgId);
       }
-      form.append("attachments[]", buffer, { filename: fileName, contentType });
+      form.append("attachments[]", buffer, { filename: metadata.fileName, contentType: metadata.contentType });
 
       const url = this.url(`/api/v1/accounts/${this.cfg.accountId}/conversations/${conversationId}/messages`);
       this.log("[createIncomingMedia] POST", {
@@ -722,8 +729,8 @@ export class ChatwootClient {
         content: params.content,
         message_type: messageType,
         private: isPrivate,
-        filename: fileName,
-        contentType,
+        filename: metadata.fileName,
+        contentType: metadata.contentType,
         zaloMsgId: params.zaloMsgId,
       });
       const res = await axios.post(url, form, {
@@ -770,6 +777,19 @@ export class ChatwootClient {
       return null;
     } finally {
       clearTimeout(timeout);
+    }
+  }
+
+  async deleteMessage(conversationId: number, messageId: number): Promise<void> {
+    try {
+      await this.request(
+        `/api/v1/accounts/${this.cfg.accountId}/conversations/${conversationId}/messages/${messageId}`,
+        { method: "DELETE", headers: this.headers() },
+        "deleteMessage",
+      );
+    } catch (err) {
+      if (err instanceof ChatwootRequestError && err.status === 404) return;
+      throw err;
     }
   }
 

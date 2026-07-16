@@ -5,6 +5,7 @@ import { OutgoingCache } from "./outgoingCache";
 import { createServer } from "./server";
 import { contentKey } from "./messageKeys";
 import { MessageMapStore } from "./messageMapStore";
+import { MappingAwareMap, RecallCoordinator } from "./recallCoordinator";
 import {
   normalizeActionlistSystemMessage,
   normalizeCalltimeSystemMessage,
@@ -44,7 +45,17 @@ if (!ZALO_IMEI || !ZALO_USER_AGENT || !ZALO_COOKIE_JSON) {
 async function bootstrap() {
   const cache = new OutgoingCache();
   const threadMap = new Map<number, string>();
-  const messageMap = new Map<string, { conversationId: number; cwId: number; preview: string; sender?: "self" | "contact"; quote?: Record<string, unknown> }>(); // Zalo msgId -> Chatwoot message id + preview
+  type RuntimeMessageMapping = {
+    conversationId: number;
+    cwId: number;
+    preview: string;
+    sender?: "self" | "contact";
+    quote?: Record<string, unknown>;
+  };
+  let recallCoordinator: RecallCoordinator | null = null;
+  const messageMap = new MappingAwareMap<RuntimeMessageMapping>((zaloMsgId) => {
+    if (recallCoordinator) void recallCoordinator.mappingAvailable(zaloMsgId);
+  }); // Zalo msgId -> Chatwoot message id + preview
   const captionBuffer = new Map<string, { text: string; exp: number; used: boolean; isSelf: boolean }>(); // key: threadId
   const groupThreadIds = new Set<string>(); // raw Zalo group threadIds we have seen (used to route self events correctly)
   const groupInferenceCache = new Map<string, { isGroup: boolean; exp: number }>();
@@ -72,10 +83,10 @@ async function bootstrap() {
     if (!event.targetMsgId) return "";
     const raw = (target?.preview || event.targetPreview || "").trim();
     const firstLine = raw.split(/\r?\n/)[0]?.replace(/^\[|\]$/g, "").trim();
-    if (firstLine && /^Zalo (image|photo|sticker|file|video|voice|audio) ref \w+/i.test(firstLine)) {
+    if (firstLine && /^Zalo (image|photo|gif|sticker|file|video|voice|audio) ref \w+/i.test(firstLine)) {
       return `[Reply to ${firstLine}]\n`;
     }
-    const isMedia = /^(image|photo|sticker|file|video|voice|audio)\b/i.test(raw) || raw.toUpperCase() === "IMAGE";
+    const isMedia = /^(image|photo|gif|sticker|file|video|voice|audio)\b/i.test(raw) || raw.toUpperCase() === "IMAGE";
     if (target && isMedia) {
       const rawKind = raw.split(/\s+/)[0] || "media";
       const kind = rawKind.charAt(0).toUpperCase() + rawKind.slice(1).toLowerCase();
@@ -109,6 +120,7 @@ async function bootstrap() {
 
   const mediaPlaceholder = (type: string) => {
     if (type === "image") return "IMAGE";
+    if (type === "gif") return "GIF";
     if (type === "sticker") return "STICKER";
     return "FILE";
   };
@@ -125,23 +137,26 @@ async function bootstrap() {
 
   const mediaFallbackExt = (type: string) => {
     if (type === "sticker") return "webp";
+    if (type === "gif") return "gif";
     if (type === "image") return "jpg";
     return "bin";
   };
 
   const mediaContentTypeHint = (type: string, fileName: string) => {
     if (type === "sticker") return "image/webp";
+    if (type === "gif") return "image/gif";
     if (type === "image") return inferContentTypeHint(fileName, "image/jpeg");
     return inferContentTypeHint(fileName, "application/octet-stream");
   };
 
   const mediaChatwootType = (type: string): "image" | "file" => {
-    if (type === "image" || type === "sticker") return "image";
+    if (type === "image" || type === "gif" || type === "sticker") return "image";
     return "file";
   };
 
   const mediaPreviewLabel = (type: string) => {
     if (type === "image") return "Image";
+    if (type === "gif") return "GIF";
     if (type === "sticker") return "Sticker";
     return "File";
   };
@@ -153,6 +168,7 @@ async function bootstrap() {
 
   const mediaKindLabel = (type: string) => {
     if (type === "image") return "image";
+    if (type === "gif") return "gif";
     if (type === "sticker") return "sticker";
     return "file";
   };
@@ -347,10 +363,28 @@ async function bootstrap() {
     sessionFile: ZALO_SESSION_FILE,
   });
 
+  recallCoordinator = new RecallCoordinator({
+    lookup: (zaloMsgId) => messageMap.get(zaloMsgId) || messageStore.get(zaloMsgId),
+    deleteMessage: (conversationId, cwId) => chatwootClient.deleteMessage(conversationId, cwId),
+    onDeleted: (zaloMsgId) => {
+      messageMap.delete(zaloMsgId);
+      messageStore.delete(zaloMsgId);
+    },
+  });
+
   await zaloClient.connect();
 
   zaloClient.onEvent(async (event) => {
     try {
+      if (event.type === "undo") {
+        if (!event.targetMsgId) {
+          console.warn("[zalo-recall-missing-target]", { msgId: event.msgId, threadId: event.threadId });
+          return;
+        }
+        await recallCoordinator?.recall({ targetMsgId: event.targetMsgId, threadId: event.threadId });
+        return;
+      }
+
       if (event.type === "image") {
         console.log("[zalo-image-debug]", {
           isSelf: event.isSelf,
@@ -992,7 +1026,7 @@ async function bootstrap() {
       }
 
       if (!derivedIsSelf) {
-        if (event.type === "image" || event.type === "file" || event.type === "sticker") {
+        if (event.type === "image" || event.type === "gif" || event.type === "file" || event.type === "sticker") {
           if (event.mediaUrl) {
             const placeholder = mediaPlaceholder(event.type);
             const caption =
@@ -1039,7 +1073,7 @@ async function bootstrap() {
             });
             if (!msgId) {
               let fallbackText = `FILE: ${event.mediaUrl || event.text || ""}`;
-              if (event.type === "image") {
+              if (event.type === "image" || event.type === "gif") {
                 const imageText = event.text ? `\n${event.text}` : "";
                 fallbackText = `IMAGE: ${event.mediaUrl}${imageText}`;
               }
@@ -1105,7 +1139,7 @@ async function bootstrap() {
         }
       } else {
         // self events from native app
-        if (event.type === "image" || event.type === "file" || event.type === "sticker") {
+        if (event.type === "image" || event.type === "gif" || event.type === "file" || event.type === "sticker") {
           const placeholder = mediaPlaceholder(event.type);
           // Skip self media echoes from Chatwoot outbound attachments.
           const echoKey = attachmentEchoKey(event.threadId, event.fileName || placeholder);

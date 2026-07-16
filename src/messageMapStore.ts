@@ -64,6 +64,12 @@ export class MessageMapStore {
     this.scheduleSave();
   }
 
+  delete(zaloMsgId: string): boolean {
+    const deleted = this.map.delete(zaloMsgId);
+    if (deleted) this.scheduleSave();
+    return deleted;
+  }
+
   private scheduleSave() {
     if (this.saveTimer) return;
     this.saveTimer = setTimeout(() => {

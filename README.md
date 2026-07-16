@@ -12,9 +12,12 @@ This is an unofficial integration using an unofficial Zalo Personal API. Account
 
 - Creates or reuses Chatwoot contacts/conversations for Zalo peers.
 - Sends incoming Zalo messages/media to a Chatwoot API inbox.
+- Uploads Zalo GIF messages as animated `image/gif` attachments instead of raw SDK JSON.
+- Recovers PDF, GIF, JPEG, PNG, and WebP extensions when Zalo supplies a missing or generic filename.
 - Forwards public outgoing Chatwoot messages and templates to Zalo.
 - Skips private notes and bridge-originated Chatwoot messages to avoid loops.
 - Stores message mappings in `data/message-map.json` so replies can become native Zalo quotes.
+- Mirrors Zalo message recalls to the exact mapped Chatwoot message.
 - Supports optional `[[zalo:alias]]` markers for group mentions.
 
 ## Limitations
@@ -22,6 +25,7 @@ This is an unofficial integration using an unofficial Zalo Personal API. Account
 - Zalo Personal is not an official stable API surface.
 - QR login and cookie/session persistence can expire without warning.
 - Media forwarding depends on URLs that both services can fetch.
+- Recall synchronization requires the target message to exist in the current durable message map. Unknown targets are logged and ignored.
 - Group mention IDs must be maintained by the operator.
 - This bridge is source-only; build output and runtime data are intentionally not committed.
 

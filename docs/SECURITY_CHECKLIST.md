@@ -8,6 +8,7 @@
 - [ ] `npm run build` passes.
 - [ ] `npm test` passes.
 - [ ] `npm audit --omit=dev` has no unresolved high severity issues.
+- [ ] Scoped UBS reports no unresolved critical or warning findings in changed executable files.
 - [ ] `gitleaks detect --no-git --source .` passes if gitleaks is installed.
 - [ ] README states the unofficial API and policy/stability risk.
 - [ ] `SECURITY.md` explains session/cookie/token exposure response.

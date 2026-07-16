@@ -37,6 +37,25 @@
 - Look for `[zalo-send-attachment-error]` or Chatwoot upload errors.
 - The bridge may fall back to sending a text URL when binary media transfer fails.
 
+## GIF Appears as JSON
+
+- Confirm the incoming event is normalized as `type: "gif"` in `[zalo-event]`.
+- Confirm the selected URL is the GIF `href` or `params.small`, not a static thumbnail.
+- Run `npm run test:media-recall` and rebuild before restarting the service.
+
+## File Appears as `file.bin`
+
+- Check whether Zalo supplied a filename extension or `params.fileExt`.
+- Check the downloaded response MIME type.
+- The bridge recognizes PDF, GIF, JPEG, PNG, and WebP signatures. Unknown content intentionally falls back to `.bin`.
+
+## Recalled Message Remains in Chatwoot
+
+- Confirm logs contain a Zalo event with `type: "undo"` and a `targetMsgId`.
+- Confirm `data/message-map.json` is present and writable.
+- `zalo-recall-pending` means no exact mapping was available yet. The bridge waits for the message mapping instead of guessing or deleting another message.
+- `zalo-recall-delete-failed` includes the Chatwoot conversation and message IDs needed for API troubleshooting.
+
 ## Webhook Auth or Config Mismatch
 
 - Chatwoot API inbox identifiers are separate from account and inbox IDs.

@@ -9,7 +9,8 @@
     "dev": "ts-node src/index.ts",
     "login:qr": "ts-node scripts/login-qr.ts",
     "import:browser-session": "ts-node scripts/import-browser-session.ts",
-    "test": "npm run test:zalo-mentions && npm run test:actionlist-system",
+    "test": "npm run test:media-recall && npm run test:zalo-mentions && npm run test:actionlist-system",
+    "test:media-recall": "ts-node scripts/test-media-recall.ts",
     "test:zalo-mentions": "ts-node scripts/test-zalo-mentions.ts",
     "test:actionlist-system": "ts-node scripts/test-actionlist-system.ts"
   },

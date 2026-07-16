@@ -130,6 +130,12 @@ npm run build
 npm test
 ```
 
+The focused media and recall suite can also be run on its own:
+
+```bash
+npm run test:media-recall
+```
+
 - Webhook logs should show:
 
 ```text
@@ -149,6 +155,13 @@ npm test
 test -s data/message-map.json
 ```
 
+- GIF and recall test:
+  1. Send a GIF from Zalo's built-in GIF picker.
+  2. Confirm Chatwoot displays an animated image attachment, not a JSON message.
+  3. Recall that GIF in Zalo.
+  4. Confirm Chatwoot marks only that message as deleted and removes its attachment.
+  5. Confirm the bridge logs `zalo-recall-deleted` with the mapped Chatwoot message ID.
+
 ## Failure Modes / Edge Cases
 
 - QR expires: rerun `npm run login:qr` and scan the new `data/qr.png`.
@@ -156,6 +169,8 @@ test -s data/message-map.json
 - Chatwoot outgoing not delivered: verify webhook URL, token, inbox ID, and that the Chatwoot message is not private.
 - Incoming not visible in Chatwoot: check `CHATWOOT_INBOX_IDENTIFIER`, account ID, token permissions, and bridge logs for Chatwoot API errors.
 - Media upload fails: verify the media URL is reachable from the bridge and Chatwoot, then check attachment logs.
+- A file appears as `file.bin`: run `npm run test:media-recall`, then inspect the response MIME type and file signature. Recognized PDF, GIF, JPEG, PNG, and WebP payloads should receive a matching extension.
+- A recalled Zalo message remains visible: check for an `undo` event and confirm `data/message-map.json` contains the target Zalo message ID.
 - Replies lose native quote context: verify `data/message-map.json` persists and is writable by the service user.
 
 ## Rollback / Abort
@@ -187,6 +202,8 @@ journalctl -u chatwoot-zalo-personal-bridge -f --lines 100
   - `[chatwoot-callback] incoming`
   - `[chatwoot-callback] forward to Zalo`
   - `[zalo-send-attachment]`
+  - `[zalo-recall-deleted]`
+  - `[zalo-recall-pending]`
   - `[zalo-personal-bridge] messageMapStore loaded`
 
 ## Review Cadence

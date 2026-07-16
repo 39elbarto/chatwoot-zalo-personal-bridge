@@ -1,8 +1,8 @@
 import fs from "fs";
 import path from "path";
-import { Zalo, ThreadType, type Message, type Reaction, type Credentials, type API } from "@warriorteam/zalo-personal";
+import { Zalo, ThreadType, type Message, type Reaction, type Undo, type Credentials, type API } from "@warriorteam/zalo-personal";
 
-export type ZaloEventType = "text" | "image" | "file" | "sticker" | "reaction";
+export type ZaloEventType = "text" | "image" | "gif" | "file" | "sticker" | "reaction" | "undo";
 
 export interface ZaloEvent {
   threadId: string;
@@ -21,6 +21,68 @@ export interface ZaloEvent {
   targetPreview?: string;
   quote?: Record<string, unknown>;
   stickerId?: string;
+}
+
+type RichMediaContent = Record<string, any>;
+
+export function parseRichMediaParams(content: RichMediaContent): Record<string, any> {
+  const params = content?.params;
+  if (params && typeof params === "object") return params;
+  if (typeof params !== "string" || !params.trim()) return {};
+  try {
+    const parsed = JSON.parse(params);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+export function normalizeGifPayload(content: RichMediaContent, msgId: string) {
+  const params = parseRichMediaParams(content);
+  const href = typeof content?.href === "string" ? content.href.trim() : "";
+  const small = typeof params?.small === "string" ? params.small.trim().replace(/\\\//g, "/") : "";
+  const thumb = typeof content?.thumb === "string" ? content.thumb.trim() : "";
+  return {
+    mediaUrl: href || small || thumb || undefined,
+    fileName: `zalo-gif-${msgId || "unknown"}.gif`,
+    text: typeof content?.description === "string" && content.description.trim() ? content.description.trim() : undefined,
+  };
+}
+
+export function normalizeSharedFilePayload(content: RichMediaContent, msgId: string) {
+  const params = parseRichMediaParams(content);
+  const href = typeof content?.href === "string" ? content.href.trim() : "";
+  const title =
+    (typeof content?.fileName === "string" && content.fileName.trim()) ||
+    (typeof content?.title === "string" && content.title.trim()) ||
+    `zalo-file-${msgId || "unknown"}`;
+  const rawExtension =
+    (typeof params?.fileExt === "string" && params.fileExt.trim()) ||
+    (typeof content?.fileExt === "string" && content.fileExt.trim()) ||
+    "";
+  const extension = rawExtension.replace(/^\./, "").toLowerCase();
+  const fileName = extension && !title.toLowerCase().endsWith(`.${extension}`) ? `${title}.${extension}` : title;
+  const description = typeof content?.description === "string" ? content.description.trim() : "";
+  return {
+    mediaUrl: href || undefined,
+    fileName,
+    text: description || title,
+  };
+}
+
+export function normalizeUndoPayload(undo: Undo): ZaloEvent | null {
+  const data: any = (undo as any)?.data || {};
+  const content: any = data?.content || {};
+  const targetMsgId = content?.globalMsgId ?? content?.cliMsgId ?? data?.realMsgId;
+  if (targetMsgId === undefined || targetMsgId === null || String(targetMsgId).trim() === "") return null;
+  return {
+    threadId: String((undo as any)?.threadId || ""),
+    msgId: String(data?.msgId || data?.cliMsgId || `undo:${targetMsgId}`),
+    fromId: String(data?.uidFrom || data?.userId || ""),
+    isSelf: !!(undo as any)?.isSelf,
+    type: "undo",
+    targetMsgId: String(targetMsgId),
+  };
 }
 
 export type ZaloMentionPayload = {
@@ -152,6 +214,7 @@ export class ZaloPersonalClient implements ZaloClient {
 
     this.api.listener.on("message", (message) => this.handleMessage(message));
     this.api.listener.on("reaction", (reaction) => this.handleReaction(reaction));
+    this.api.listener.on("undo", (undo) => this.handleUndo(undo));
     this.api.listener.start();
 
     await this.persistSession(credentials);
@@ -446,8 +509,18 @@ export class ZaloPersonalClient implements ZaloClient {
           }
         : undefined;
 
-    switch (msgType) {
-      case "chat.photo":
+    const normalizedMsgType: string =
+      msgType === "chat.photo"
+        ? "photo"
+        : msgType === "chat.file" || msgType === "share.file"
+          ? "file"
+          : msgType === "chat.gif"
+            ? "gif"
+            : msgType === "chat.sticker"
+              ? "sticker"
+              : msgType;
+
+    switch (normalizedMsgType) {
       case "photo":
         type = "image";
         mediaUrl = contentObj?.href || data.href;
@@ -495,29 +568,29 @@ export class ZaloPersonalClient implements ZaloClient {
           });
         }
         break;
-      case "chat.file":
-      case "file":
+      case "file": {
         type = "file";
-        mediaUrl = contentObj?.href || data.href;
-        fileName = contentObj?.fileName || contentObj?.title || this.deriveFilename(mediaUrl, msgId, "bin");
-        text =
-          typeof content === "string"
-            ? content
-            : contentObj?.description ||
-              contentObj?.msg ||
-              contentObj?.caption ||
-              contentObj?.text ||
-              contentObj?.title ||
-              undefined;
+        const normalized = normalizeSharedFilePayload(contentObj || {}, msgId);
+        mediaUrl = normalized.mediaUrl || data.href;
+        fileName = normalized.fileName;
+        text = typeof content === "string" ? content : normalized.text || contentObj?.msg || contentObj?.caption || contentObj?.text;
         break;
-    case "chat.sticker":
-    case "sticker":
-      type = "sticker";
-      mediaUrl = contentObj?.href || data.href || contentObj?.stickerUrl;
-      stickerId = contentObj?.stickerId || contentObj?.sticker || contentObj?.id || msgId;
-      fileName = contentObj?.stickerId ? `sticker-${contentObj.stickerId}.webp` : this.deriveFilename(mediaUrl, msgId, "webp");
-      bridgeLogger.log("[zalo-sticker-raw]", JSON.stringify(contentObj || content, null, 2));
-      break;
+      }
+      case "gif": {
+        type = "gif";
+        const normalized = normalizeGifPayload(contentObj || {}, msgId);
+        mediaUrl = normalized.mediaUrl || data.href;
+        fileName = normalized.fileName;
+        text = normalized.text;
+        break;
+      }
+      case "sticker":
+        type = "sticker";
+        mediaUrl = contentObj?.href || data.href || contentObj?.stickerUrl;
+        stickerId = contentObj?.stickerId || contentObj?.sticker || contentObj?.id || msgId;
+        fileName = contentObj?.stickerId ? `sticker-${contentObj.stickerId}.webp` : this.deriveFilename(mediaUrl, msgId, "webp");
+        bridgeLogger.log("[zalo-sticker-raw]", JSON.stringify(contentObj || content, null, 2));
+        break;
       default:
         type = "text";
         text = typeof content === "string" ? content : contentObj?.msg || contentObj?.text || JSON.stringify(content);
@@ -575,6 +648,15 @@ export class ZaloPersonalClient implements ZaloClient {
       reactionType: content?.rIcon || content?.rType,
       targetMsgId: targetMsgId ? String(targetMsgId) : undefined,
     };
+    this.emit(event);
+  }
+
+  private handleUndo(undo: Undo) {
+    const event = normalizeUndoPayload(undo);
+    if (!event) {
+      bridgeLogger.warn("[zalo-recall-invalid-event]");
+      return;
+    }
     this.emit(event);
   }
 
