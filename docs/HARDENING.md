@@ -32,3 +32,21 @@ The allowed delta is limited to:
 - generic README, runbook, troubleshooting, security checklist, and systemd example documentation
 
 Fixtures use synthetic numeric IDs and `example.test` URLs. Runtime domains, account/inbox values, contacts, UIDs, cookies, sessions, QR data, message maps, mention maps, private callback aliases, and infrastructure paths are outside the public boundary.
+
+## Rotate the Chatwoot service token
+
+For a Chatwoot `Channel::Api` connector, `CHATWOOT_API_TOKEN` authenticates API
+requests. It is independent of the inbox identifier, webhook route, and Zalo
+session. Rotating only this token does not recreate the inbox or require a new
+Zalo QR login.
+
+Use a regular technical Chatwoot agent with access only to the connector account
+and required inboxes. Before cutover, validate the new token through internal
+profile, inbox, and conversation reads plus a private create/delete note in an
+approved test conversation. Back up `.env`, replace only the token assignment,
+parse the candidate dotenv, and restart one bridge instance at a time. Require
+`ready`, the expected account/inbox mapping, and account match after restart.
+
+Do not revoke the old token until encrypted automation credentials and off-host
+consumers have been inventoried. Removing plaintext references from the active
+server does not prove the token is unused elsewhere.
