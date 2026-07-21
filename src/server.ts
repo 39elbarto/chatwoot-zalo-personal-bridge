@@ -5,6 +5,7 @@ import { OutgoingCache } from "./outgoingCache";
 import { contentKey } from "./messageKeys";
 import type { MessageMapStore } from "./messageMapStore";
 import { ZaloMentionResolver } from "./zaloMentions";
+import type { RuntimeStatus } from "./runtimeStatus";
 
 export type ServerDeps = {
   chatwootClient: ChatwootClient;
@@ -15,6 +16,9 @@ export type ServerDeps = {
   messageMap: Map<string, { conversationId: number; cwId: number; preview: string; sender?: "self" | "contact"; quote?: Record<string, unknown> }>;
   messageStore?: MessageMapStore;
   mentionsConfigFile?: string;
+  runtimeStatus: RuntimeStatus;
+  threadIdPrefixes?: readonly string[];
+  routePrefixes?: readonly string[];
 };
 
 type ChatwootWebhookPayload = {
@@ -47,12 +51,52 @@ function normalizeTemplateTextForZalo(text: string) {
     .trim();
 }
 
-function normalizeThreadId(raw?: string | number | null) {
+export const threadIdSources = [
+  "threadMap",
+  "contactCustomAttribute",
+  "conversationCustomAttribute",
+  "sourceId",
+  "contactIdentifier",
+] as const;
+
+export type ThreadIdSource = (typeof threadIdSources)[number];
+export type ThreadIdCandidate = { raw: string | number | null | undefined; source: ThreadIdSource };
+export type ResolvedThreadId = { threadId: string; source: ThreadIdSource };
+
+function normalizedPrefixes(prefixes: readonly string[]): string[] {
+  return [...new Set(prefixes.map((prefix) => prefix.trim()).filter((prefix) => /^[a-z][a-z0-9_-]*:$/.test(prefix)))]
+    .sort((left, right) => right.length - left.length);
+}
+
+export function normalizeThreadId(
+  raw?: string | number | null,
+  prefixes: readonly string[] = ["zalo:"],
+): string | null {
   if (raw === null || raw === undefined) return null;
-  const str = String(raw).trim();
-  // Chatwoot contact identifiers are `zalo:<peerZaloId>` where peerZaloId may be `group:<threadId>`.
-  // Keep the `group:` prefix so `zaloClient.sendText()` can pick the correct ThreadType.
-  return str.replace(/^zalo\d*:/, "").replace(/^:+/, "");
+  let candidate = String(raw).trim();
+  const matchedPrefix = normalizedPrefixes(prefixes).find((prefix) => candidate.startsWith(prefix));
+  if (matchedPrefix) candidate = candidate.slice(matchedPrefix.length);
+  candidate = candidate.replace(/^:+/, "");
+  candidate = candidate.replace(/-dup$/, "");
+  return /^(?:[1-9][0-9]*|group:[1-9][0-9]*)$/.test(candidate) ? candidate : null;
+}
+
+export function resolveThreadId(
+  candidates: readonly ThreadIdCandidate[],
+  prefixes: readonly string[] = ["zalo:"],
+): ResolvedThreadId | null {
+  for (const candidate of candidates) {
+    const threadId = normalizeThreadId(candidate.raw, prefixes);
+    if (threadId) return { threadId, source: candidate.source };
+  }
+  return null;
+}
+
+export function normalizeRoutePrefixes(prefixes: readonly string[]): string[] {
+  return [...new Set(prefixes.map((prefix) => prefix.trim()).filter(Boolean).map((prefix) => {
+    const withSlash = prefix.startsWith("/") ? prefix : `/${prefix}`;
+    return withSlash.replace(/\/+$/, "");
+  }))].filter((prefix) => /^\/[a-z0-9][a-z0-9/_-]*$/i.test(prefix) && !prefix.includes(".."));
 }
 
 function attachmentEchoKey(threadId: string, text: string) {
@@ -130,19 +174,59 @@ function attachmentType(attachment: any): "image" | "file" {
   return "file";
 }
 
-export function createServer({ chatwootClient, zaloClient, cache, inboxId, threadMap, messageMap, messageStore, mentionsConfigFile }: ServerDeps) {
+export function sanitizeAttachmentFileName(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const leaf = value.replace(/\\/g, "/").split("/").pop() || "";
+  const safe = leaf
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .replace(/[<>:"/\\|?*]/g, "_")
+    .replace(/^[. ]+|[. ]+$/g, "")
+    .slice(0, 180);
+  return safe || undefined;
+}
+
+export function createServer({
+  chatwootClient,
+  zaloClient,
+  cache,
+  inboxId,
+  threadMap,
+  messageMap,
+  messageStore,
+  mentionsConfigFile,
+  runtimeStatus,
+  threadIdPrefixes = ["zalo:"],
+  routePrefixes = [],
+}: ServerDeps) {
   const app = express();
   const mentionResolver = new ZaloMentionResolver(mentionsConfigFile || "./data/zalo-mentions.json");
-  const sendFileUrl = zaloClient.sendFile.bind(zaloClient);
+  const sendDocument = zaloClient.sendDocument.bind(zaloClient);
   app.use(express.json({ limit: "20mb" }));
 
-  app.get("/health", (_req, res) => {
-    console.log("[zalo-personal-bridge] health ok");
-    res.json({ ok: true });
-  });
+  const healthHandler = (_req: express.Request, res: express.Response) => {
+    const health = runtimeStatus.health();
+    return res.status(health.ok ? 200 : 503).json(health);
+  };
+  const normalizedRoutePrefixes = normalizeRoutePrefixes(routePrefixes);
+  for (const path of ["/health", ...normalizedRoutePrefixes.map((prefix) => `${prefix}/health`)]) {
+    app.get(path, healthHandler);
+  }
+
+  const requireReady: express.RequestHandler = (_req, res, next) => {
+    if (!runtimeStatus.isReady()) return res.status(503).json({ success: false, error: "not_ready" });
+    next();
+  };
+
+  const validateWebhookBody: express.RequestHandler = (req, res, next) => {
+    if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
+      return res.json({ success: true, skipped: "invalid_payload" });
+    }
+    next();
+  };
 
   const callbackHandler = async (req: express.Request, res: express.Response) => {
-    console.log("[chatwoot-callback] %s %s", req.method, req.url);
+    if (!runtimeStatus.isReady()) return res.status(503).json({ success: false, error: "not_ready" });
+    console.log("[chatwoot-callback] accepted", { route: req.path });
     try {
       const validation = schema.validate(req.body);
       if (validation.error || !validation.value) {
@@ -212,40 +296,48 @@ export function createServer({ chatwootClient, zaloClient, cache, inboxId, threa
       const contactIdentifier =
         contact?.identifier || conversation?.contact?.identifier || msg?.sender?.identifier || null;
 
-      const threadIdCandidates = [
-        conversationId ? normalizeThreadId(threadMap.get(conversationId)) : null,
-        normalizeThreadId(raw?.contact?.custom_attributes?.zalo2_thread_id),
-        normalizeThreadId(conversation?.contact?.custom_attributes?.zalo2_thread_id),
-        normalizeThreadId(rawSource),
-        normalizeThreadId(contactIdentifier),
-      ].filter(Boolean) as string[];
-      let threadId = threadIdCandidates[0] || null;
+      const threadIdCandidates: ThreadIdCandidate[] = [
+        { raw: conversationId ? threadMap.get(conversationId) : null, source: "threadMap" },
+        { raw: raw?.contact?.custom_attributes?.zalo2_thread_id, source: "contactCustomAttribute" },
+        {
+          raw: conversation?.contact?.custom_attributes?.zalo2_thread_id,
+          source: "conversationCustomAttribute",
+        },
+        { raw: rawSource, source: "sourceId" },
+        { raw: contactIdentifier, source: "contactIdentifier" },
+      ];
+      let resolvedThread = resolveThreadId(threadIdCandidates, threadIdPrefixes);
 
-      if (!threadId && conversationId) {
+      if (!resolvedThread && conversationId) {
         try {
           const conv = await chatwootClient.getConversation(conversationId);
           const data = conv.body?.payload ?? conv.body;
-          threadId =
-            normalizeThreadId(data?.contact_inbox?.source_id) ||
-            normalizeThreadId(data?.contact?.custom_attributes?.zalo2_thread_id) ||
-            null;
+          resolvedThread = resolveThreadId(
+            [
+              {
+                raw: data?.contact?.custom_attributes?.zalo2_thread_id,
+                source: "conversationCustomAttribute",
+              },
+              { raw: data?.contact_inbox?.source_id, source: "sourceId" },
+            ],
+            threadIdPrefixes,
+          );
         } catch (err) {
-          console.warn("[zalo-personal-bridge] failed to fetch conversation", err);
+          runtimeStatus.setError("conversation_lookup_failed");
+          console.warn("[zalo-personal-bridge] failed to fetch conversation", {
+            category: "conversation_lookup_failed",
+          });
         }
       }
 
-      if (threadId && threadId.endsWith("-dup")) {
-        threadId = threadId.replace(/-dup$/, "");
+      if (!resolvedThread) {
+        console.warn("[chatwoot-callback] invalid thread id, responding OK to avoid retry", {
+          validation: "rejected",
+          category: "invalid_thread_id",
+        });
+        return res.json({ success: true, skipped: "invalid_thread_id" });
       }
-
-      if (!threadId && conversationId && threadMap.has(conversationId)) {
-        threadId = normalizeThreadId(threadMap.get(conversationId)) || null;
-      }
-
-      if (!threadId) {
-        console.warn("[chatwoot-callback] missing threadId, responding OK to avoid 502");
-        return res.json({ success: true, skipped: "missing_thread_id" });
-      }
+      const { threadId, source: threadSource } = resolvedThread;
 
       const content: string | undefined = typeof msg.content === "string" ? msg.content : msg?.content?.text;
       const attachments: AttachmentPayload[] =
@@ -295,21 +387,19 @@ export function createServer({ chatwootClient, zaloClient, cache, inboxId, threa
               const isGroup = threadId.startsWith("group:");
               console.log("[chatwoot-callback] forward to Zalo", {
                 conversationId,
-                threadId,
+                threadSource,
+                threadIdValidation: "accepted",
                 isGroup,
                 messageId: msg?.id,
                 normalized: (messageType === "template" && textForZalo !== trimmedContent) || finalTextForZalo !== textForZalo,
                 replyToId,
-                replyPreview: replyTarget?.preview || null,
                 nativeQuote: !!nativeQuote,
                 syntheticQuote: !!nativeQuote && !replyTarget?.quote,
-                quoteOwner: nativeQuote?.uidFrom || null,
-                mentionAliases: mentionResult?.aliases || [],
                 mentionCount: mentionsForZalo.length,
-                mentionInsertedLabels: mentionResult?.insertedLabels || [],
-                mentionMissingAliases: mentionResult?.missingAliases || [],
               });
               const msgId = await zaloClient.sendText(threadId, finalTextForZalo, nativeQuote, mentionsForZalo);
+              if (msgId) runtimeStatus.markOutboundZaloSend();
+              else runtimeStatus.setError("zalo_text_send_failed");
               cache.addMany([msgId, cwTextKey(threadId, finalTextForZalo)]);
               if (msgId && cwMessageId) {
                 const entry = {
@@ -322,10 +412,11 @@ export function createServer({ chatwootClient, zaloClient, cache, inboxId, threa
                 messageStore?.set(String(msgId), entry);
               }
             } catch (err) {
+              runtimeStatus.setError("zalo_text_send_failed");
               console.warn("[chatwoot-callback] text forward failed", {
-                threadId,
+                threadSource,
                 isGroup: threadId.startsWith("group:"),
-                error: (err as Error).message,
+                category: "text_forward_failed",
               });
             }
           })(),
@@ -337,23 +428,24 @@ export function createServer({ chatwootClient, zaloClient, cache, inboxId, threa
         tasks.push(
           (async () => {
             console.log("[chatwoot-callback] attachment forward", {
-              url: att.url,
+              threadSource,
               type: att.fileType,
-              fileName: att.fileName,
             });
             let contentLength: number | null = null;
             let contentType: string | null = null;
             try {
-              const head = await fetch(att.url, { method: "HEAD", signal: AbortSignal.timeout(10_000) });
+              const head = await fetch(att.url, { method: "HEAD", signal: AbortSignal.timeout(15_000) });
               if (!head.ok) {
-                console.warn("[zalo-send-image-url-bad]", { url: att.url, status: head.status });
+                runtimeStatus.setError("attachment_fetch_failed");
+                console.warn("[zalo-send-image-url-bad]", { category: "attachment_head_status", status: head.status });
                 return;
               }
               const len = head.headers.get("content-length");
               if (len && !Number.isNaN(Number(len))) contentLength = Number(len);
               contentType = head.headers.get("content-type");
             } catch (err) {
-              console.warn("[zalo-send-image-url-bad]", { url: att.url, error: (err as Error).message });
+              runtimeStatus.setError("attachment_fetch_failed");
+              console.warn("[zalo-send-image-url-bad]", { category: "attachment_head_failed" });
               return;
             }
             let filename = att.fileName || undefined;
@@ -365,9 +457,9 @@ export function createServer({ chatwootClient, zaloClient, cache, inboxId, threa
                 filename = undefined;
               }
             }
+            filename = sanitizeAttachmentFileName(filename);
             console.log("[zalo-send-attachment]", {
               type: att.fileType,
-              filename,
               size: contentLength,
               via: "buffer",
               contentType,
@@ -380,6 +472,7 @@ export function createServer({ chatwootClient, zaloClient, cache, inboxId, threa
             if (att.fileType === "image") {
               const msgId = await zaloClient.sendImage(threadId, att.url, filename);
               if (msgId) {
+                runtimeStatus.markOutboundZaloSend();
                 cache.addMany([msgId, filename ? attachmentEchoKey(threadId, filename) : null]);
                 if (cwMessageId) {
                   const entry = {
@@ -393,13 +486,18 @@ export function createServer({ chatwootClient, zaloClient, cache, inboxId, threa
                 }
               } else if (!hasText) {
                 const fbText = `Image: ${att.url}`;
-                console.warn("[zalo-send-attachment-error]", { type: "image", filename, message: "fallback_to_text" });
+                console.warn("[zalo-send-attachment-error]", { type: "image", category: "fallback_to_text" });
                 const fbMsgId = await zaloClient.sendText(threadId, fbText);
+                if (fbMsgId) runtimeStatus.markOutboundZaloSend();
+                else runtimeStatus.setError("zalo_fallback_send_failed");
                 cache.addMany([fbMsgId, contentKey(threadId, fbText)]);
+              } else {
+                runtimeStatus.setError("zalo_image_send_failed");
               }
             } else {
-              const msgId = await sendFileUrl(threadId, att.url, filename);
+              const msgId = await sendDocument(threadId, att.url, filename);
               if (msgId) {
+                runtimeStatus.markOutboundZaloSend();
                 cache.addMany([msgId, filename ? attachmentEchoKey(threadId, filename) : null]);
                 if (cwMessageId) {
                   const entry = {
@@ -414,9 +512,13 @@ export function createServer({ chatwootClient, zaloClient, cache, inboxId, threa
               } else if (!hasText) {
                 const title = filename || "File";
                 const fbText = `Shared file: ${title}\n${att.url}`;
-                console.warn("[zalo-send-attachment-error]", { type: "file", filename: title, message: "fallback_to_text" });
+                console.warn("[zalo-send-attachment-error]", { type: "file", category: "fallback_to_text" });
                 const fbMsgId = await zaloClient.sendText(threadId, fbText);
+                if (fbMsgId) runtimeStatus.markOutboundZaloSend();
+                else runtimeStatus.setError("zalo_fallback_send_failed");
                 cache.addMany([fbMsgId, contentKey(threadId, fbText)]);
+              } else {
+                runtimeStatus.setError("zalo_file_send_failed");
               }
             }
           })(),
@@ -426,13 +528,20 @@ export function createServer({ chatwootClient, zaloClient, cache, inboxId, threa
       Promise.allSettled(tasks).catch(() => {});
       return;
     } catch (err) {
-      console.error("[chatwoot-callback] error", err);
-      return res.json({ success: true, error: (err as Error).message });
+      runtimeStatus.setError("callback_processing_failed");
+      console.error("[chatwoot-callback] error", { category: "callback_processing_failed" });
+      return res.json({ success: false, error: "callback_processing_failed" });
     }
   };
 
-  app.post("/webhooks/chatwoot", callbackHandler);
-  app.post("/callback", callbackHandler);
+  const callbackPaths = [
+    "/callback",
+    "/webhooks/chatwoot",
+    ...normalizedRoutePrefixes.map((prefix) => `${prefix}/callback`),
+  ];
+  for (const path of callbackPaths) {
+    app.post(path, requireReady, validateWebhookBody, callbackHandler);
+  }
 
   return app;
 }

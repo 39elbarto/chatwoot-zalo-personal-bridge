@@ -11,7 +11,7 @@
 
 ## Incoming Zalo Message Not Visible in Chatwoot
 
-- Confirm the bridge process is running and `/health` returns `{"ok":true}`.
+- Confirm the bridge process is running and `/health` returns HTTP 200 with `ok=true` and `readiness=ready`.
 - Confirm Zalo session is valid.
 - Confirm `CHATWOOT_API_TOKEN`, `CHATWOOT_ACCOUNT_ID`, `CHATWOOT_INBOX_ID`, and `CHATWOOT_INBOX_IDENTIFIER`.
 - Check logs for Chatwoot API response status/body.
@@ -61,3 +61,16 @@
 - Chatwoot API inbox identifiers are separate from account and inbox IDs.
 - A valid Chatwoot user token can still fail if the user lacks account access.
 - If multiple bridges share one Chatwoot account, set unique contact/source prefixes.
+
+## Health Returns 503
+
+- `account_state=mismatch`: the authenticated Zalo account differs from the private `ZALO_EXPECTED_SELF_UID`; do not send messages until the account is verified.
+- `unknown_with_expectation`: the account-info request did not prove an identity while an expected UID is configured.
+- `zalo_connected=false` or `listener_started=false`: inspect listener lifecycle logs and session validity.
+- `last_error_category` is intentionally categorical; sensitive SDK/API payloads are not returned by health.
+
+## Link Card Is Raw JSON
+
+- Run `npm run test:hardening` and rebuild.
+- Only HTTP(S) URLs are rendered. Device paths, `file:`, `data:`, and script URLs are intentionally discarded.
+- Malformed `params` must fall back to readable title/description text rather than exposing the raw payload.

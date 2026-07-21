@@ -10,6 +10,9 @@
 - [ ] `npm audit --omit=dev` has no unresolved high severity issues.
 - [ ] Scoped UBS reports no unresolved critical or warning findings in changed executable files.
 - [ ] `gitleaks detect --no-git --source .` passes if gitleaks is installed.
+- [ ] `gitleaks git . --no-banner --redact` passes across repository history.
+- [ ] Health output contains no UID, token, cookie, IMEI/device, thread, or contact identifier.
+- [ ] `.env.example` leaves `ZALO_EXPECTED_SELF_UID` empty.
 - [ ] README states the unofficial API and policy/stability risk.
 - [ ] `SECURITY.md` explains session/cookie/token exposure response.
 

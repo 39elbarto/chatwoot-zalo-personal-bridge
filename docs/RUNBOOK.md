@@ -38,6 +38,7 @@
 - `.env` created from `.env.example`.
 - `CHATWOOT_BASE_URL`, `CHATWOOT_API_TOKEN`, `CHATWOOT_ACCOUNT_ID`, `CHATWOOT_INBOX_ID`, `CHATWOOT_INBOX_IDENTIFIER`.
 - `ZALO_IMEI`, `ZALO_USER_AGENT`, `ZALO_COOKIE_JSON`, `ZALO_SESSION_FILE`.
+- Optional private `ZALO_EXPECTED_SELF_UID` and optional `HTTP_ROUTE_PREFIXES`.
 - Optional `data/zalo-mentions.json`.
 
 ## Procedure
@@ -96,7 +97,7 @@ npm run login:qr
 npm start
 ```
 
-- Expected result: logs include `listening on http://localhost:4001` or your configured port.
+- Expected result: logs include the listening address. Readiness remains pending until the authenticated account and listener are proven.
 
 ### Step 6: Configure Chatwoot Webhook
 
@@ -117,10 +118,10 @@ https://bridge.example.com/webhooks/chatwoot
 curl -fsS http://127.0.0.1:${PORT:-4001}/health
 ```
 
-- Expected output:
+- Expected result: HTTP 200 with `ok=true`, `readiness=ready`, connected/listener flags, and an allowed account state. During startup, authentication failure, identity mismatch, or listener loss, the endpoint returns HTTP 503.
 
 ```json
-{"ok":true}
+{"ok":true,"readiness":"ready","zalo_connected":true,"listener_started":true,"account_match":true}
 ```
 
 - Build and tests:
@@ -172,10 +173,15 @@ test -s data/message-map.json
 - A file appears as `file.bin`: run `npm run test:media-recall`, then inspect the response MIME type and file signature. Recognized PDF, GIF, JPEG, PNG, and WebP payloads should receive a matching extension.
 - A recalled Zalo message remains visible: check for an `undo` event and confirm `data/message-map.json` contains the target Zalo message ID.
 - Replies lose native quote context: verify `data/message-map.json` persists and is writable by the service user.
+- Health stays at 503 with `account_state=mismatch`: stop message handling and verify that this runtime uses the intended Zalo account before changing the private expected UID.
+- A callback returns 503: check `/health`; callbacks deliberately stay blocked until the bridge is ready.
+- A message is skipped as `invalid_thread_id`: inspect Chatwoot contact/source mapping. Do not weaken validation or guess a recipient.
 
 ## Rollback / Abort
 
 - Stop immediately if `.env`, cookies, QR image, session JSON, real UIDs, phone numbers, or private domains appear in git status or public logs.
+- Before an upgrade, back up the exact changed source/build/package files, unit, and private dotenv with restrictive permissions. Record protected runtime checksums without printing contents. Never overwrite session, QR, message-map, mention-map, or cookie data during a code rollback.
+
 - For a failed upgrade, stop the service and switch back to the previous deployed directory or commit:
 
 ```bash

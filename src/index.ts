@@ -6,10 +6,12 @@ import { createServer } from "./server";
 import { contentKey } from "./messageKeys";
 import { MessageMapStore } from "./messageMapStore";
 import { MappingAwareMap, RecallCoordinator } from "./recallCoordinator";
+import { RuntimeStatus, resolveAccountIdentityState } from "./runtimeStatus";
 import {
   normalizeActionlistSystemMessage,
   normalizeCalltimeSystemMessage,
   normalizeMisscallSystemMessage,
+  buildRecommendedLinkMapping,
   normalizeRecommendedLinkMessage,
   normalizeRecommendedUserMessage,
   normalizeShowProfileSystemMessage,
@@ -27,6 +29,7 @@ const CHATWOOT_INSTANCE_KEY = process.env.CHATWOOT_INSTANCE_KEY || "";
 const CHATWOOT_CONTACT_IDENTIFIER_PREFIX = process.env.CHATWOOT_CONTACT_IDENTIFIER_PREFIX || "";
 const CHATWOOT_CONTACT_IDENTIFIER_LEGACY_PREFIXES = process.env.CHATWOOT_CONTACT_IDENTIFIER_LEGACY_PREFIXES || "";
 const CHATWOOT_SOURCE_ID_PREFIX = process.env.CHATWOOT_SOURCE_ID_PREFIX || "";
+const HTTP_ROUTE_PREFIXES = process.env.HTTP_ROUTE_PREFIXES || "";
 
 const ZALO_IMEI = process.env.ZALO_IMEI || "";
 const ZALO_USER_AGENT = process.env.ZALO_USER_AGENT || "";
@@ -34,13 +37,7 @@ const ZALO_LANGUAGE = process.env.ZALO_LANGUAGE || "vi";
 const ZALO_COOKIE_JSON = process.env.ZALO_COOKIE_JSON || "";
 const ZALO_SESSION_FILE = process.env.ZALO_SESSION_FILE || "./data/session.json";
 const ZALO_MENTIONS_CONFIG_FILE = process.env.ZALO_MENTIONS_CONFIG_FILE || "./data/zalo-mentions.json";
-
-if (!CHATWOOT_BASE_URL || !CHATWOOT_API_TOKEN || !CHATWOOT_ACCOUNT_ID || !CHATWOOT_INBOX_ID || !CHATWOOT_INBOX_IDENTIFIER) {
-  throw new Error("Chatwoot env vars are required (BASE_URL, API_TOKEN, ACCOUNT_ID, INBOX_ID, INBOX_IDENTIFIER)");
-}
-if (!ZALO_IMEI || !ZALO_USER_AGENT || !ZALO_COOKIE_JSON) {
-  throw new Error("ZALO_IMEI, ZALO_USER_AGENT and ZALO_COOKIE_JSON must be set");
-}
+const ZALO_EXPECTED_SELF_UID = process.env.ZALO_EXPECTED_SELF_UID || "";
 
 async function bootstrap() {
   const cache = new OutgoingCache();
@@ -61,7 +58,105 @@ async function bootstrap() {
   const groupInferenceCache = new Map<string, { isGroup: boolean; exp: number }>();
   const threadKindLogCount = new Map<string, number>();
   const messageStore = new MessageMapStore();
-  await messageStore.load();
+  const runtimeStatus = new RuntimeStatus({ accountId: CHATWOOT_ACCOUNT_ID, inboxId: CHATWOOT_INBOX_ID });
+  runtimeStatus.setAccountState(resolveAccountIdentityState(ZALO_EXPECTED_SELF_UID, null));
+
+  const rawChatwootClient = new ChatwootClient({
+    baseUrl: CHATWOOT_BASE_URL,
+    apiToken: CHATWOOT_API_TOKEN,
+    accountId: CHATWOOT_ACCOUNT_ID,
+    inboxId: CHATWOOT_INBOX_ID,
+    inboxIdentifier: CHATWOOT_INBOX_IDENTIFIER,
+    instanceKey: CHATWOOT_INSTANCE_KEY || undefined,
+    contactIdentifierPrefix: CHATWOOT_CONTACT_IDENTIFIER_PREFIX || undefined,
+    contactIdentifierLegacyPrefixes: CHATWOOT_CONTACT_IDENTIFIER_LEGACY_PREFIXES
+      ? CHATWOOT_CONTACT_IDENTIFIER_LEGACY_PREFIXES.split(",").map((s) => s.trim()).filter(Boolean)
+      : undefined,
+    conversationSourceIdPrefix: CHATWOOT_SOURCE_ID_PREFIX || undefined,
+  });
+  const trackedChatwootWrites = new Set([
+    "createIncomingMessage",
+    "createIncomingMediaMessage",
+    "createAgentMessageFromNative",
+    "createSystemNote",
+    "createReactionNote",
+  ]);
+  const chatwootClient = new Proxy(rawChatwootClient, {
+    get(target, property, receiver) {
+      const value = Reflect.get(target, property, receiver);
+      if (typeof value !== "function") return value;
+      const bound = value.bind(target);
+      if (!trackedChatwootWrites.has(String(property))) return bound;
+      return async (...args: unknown[]) => {
+        try {
+          const result = await bound(...args);
+          if (result === null || result === false) runtimeStatus.setError("chatwoot_write_failed");
+          else runtimeStatus.markInboundChatwootWrite();
+          return result;
+        } catch (err) {
+          runtimeStatus.setError("chatwoot_write_failed");
+          throw err;
+        }
+      };
+    },
+  });
+
+  const zaloClient = new ZaloPersonalClient({
+    imei: ZALO_IMEI,
+    userAgent: ZALO_USER_AGENT,
+    language: ZALO_LANGUAGE,
+    cookieJson: ZALO_COOKIE_JSON,
+    sessionFile: ZALO_SESSION_FILE,
+  });
+
+  const app = createServer({
+    chatwootClient,
+    zaloClient,
+    cache,
+    inboxId: CHATWOOT_INBOX_ID,
+    threadMap,
+    messageMap,
+    messageStore,
+    mentionsConfigFile: ZALO_MENTIONS_CONFIG_FILE,
+    runtimeStatus,
+    routePrefixes: HTTP_ROUTE_PREFIXES.split(",").map((prefix) => prefix.trim()).filter(Boolean),
+    threadIdPrefixes: [
+      "zalo:",
+      CHATWOOT_CONTACT_IDENTIFIER_PREFIX,
+      CHATWOOT_SOURCE_ID_PREFIX,
+      ...CHATWOOT_CONTACT_IDENTIFIER_LEGACY_PREFIXES.split(","),
+    ],
+  });
+  await new Promise<void>((resolve, reject) => {
+    const server = app.listen(PORT, () => {
+      console.log(`[zalo-personal-bridge] listening on http://localhost:${PORT}; readiness pending`);
+      resolve();
+    });
+    server.once("error", reject);
+  });
+
+  if (
+    !CHATWOOT_BASE_URL ||
+    !CHATWOOT_API_TOKEN ||
+    !CHATWOOT_ACCOUNT_ID ||
+    !CHATWOOT_INBOX_ID ||
+    !CHATWOOT_INBOX_IDENTIFIER ||
+    !ZALO_IMEI ||
+    !ZALO_USER_AGENT ||
+    !ZALO_COOKIE_JSON
+  ) {
+    runtimeStatus.setError("configuration_invalid");
+    console.error("[zalo-personal-bridge] startup blocked", { category: "configuration_invalid" });
+    return;
+  }
+
+  try {
+    await messageStore.load();
+  } catch (err) {
+    runtimeStatus.setError("storage_initialization_failed");
+    console.error("[zalo-personal-bridge] startup blocked", { category: "storage_initialization_failed" });
+    return;
+  }
 
   const resolveReplyTarget = async (conversationId: number, targetZaloMsgId?: string) => {
     if (!targetZaloMsgId) return null;
@@ -341,28 +436,6 @@ async function bootstrap() {
   const cwTextKey = (threadId: string, text: string) => `cwtext:${contentKey(threadId, text)}`;
   const recentAttachmentKey = (threadId: string, fileName: string) => `cwatt_recent:${threadId}:${fileName}`;
 
-  const chatwootClient = new ChatwootClient({
-    baseUrl: CHATWOOT_BASE_URL,
-    apiToken: CHATWOOT_API_TOKEN,
-    accountId: CHATWOOT_ACCOUNT_ID,
-    inboxId: CHATWOOT_INBOX_ID,
-    inboxIdentifier: CHATWOOT_INBOX_IDENTIFIER,
-    instanceKey: CHATWOOT_INSTANCE_KEY || undefined,
-    contactIdentifierPrefix: CHATWOOT_CONTACT_IDENTIFIER_PREFIX || undefined,
-    contactIdentifierLegacyPrefixes: CHATWOOT_CONTACT_IDENTIFIER_LEGACY_PREFIXES
-      ? CHATWOOT_CONTACT_IDENTIFIER_LEGACY_PREFIXES.split(",").map((s) => s.trim()).filter(Boolean)
-      : undefined,
-    conversationSourceIdPrefix: CHATWOOT_SOURCE_ID_PREFIX || undefined,
-  });
-
-  const zaloClient = new ZaloPersonalClient({
-    imei: ZALO_IMEI,
-    userAgent: ZALO_USER_AGENT,
-    language: ZALO_LANGUAGE,
-    cookieJson: ZALO_COOKIE_JSON,
-    sessionFile: ZALO_SESSION_FILE,
-  });
-
   recallCoordinator = new RecallCoordinator({
     lookup: (zaloMsgId) => messageMap.get(zaloMsgId) || messageStore.get(zaloMsgId),
     deleteMessage: (conversationId, cwId) => chatwootClient.deleteMessage(conversationId, cwId),
@@ -372,9 +445,34 @@ async function bootstrap() {
     },
   });
 
-  await zaloClient.connect();
+  let actualSelfUid: string | null = null;
+  try {
+    actualSelfUid = await zaloClient.authenticate();
+  } catch (err) {
+    runtimeStatus.setError("authentication_failed");
+    console.error("[zalo-personal-bridge] startup blocked", { category: "authentication_failed" });
+    return;
+  }
+
+  const accountState = resolveAccountIdentityState(ZALO_EXPECTED_SELF_UID, actualSelfUid);
+  runtimeStatus.setAccountState(accountState);
+  if (!actualSelfUid) {
+    runtimeStatus.setError("identity_unknown");
+    console.error("[zalo-personal-bridge] startup blocked", { category: "identity_unknown", accountState });
+    return;
+  }
+  console.log("[zalo-personal-bridge] authenticated account", { accountState });
+  if (accountState === "mismatch" || accountState === "unknown_with_expectation") {
+    runtimeStatus.setError(accountState === "mismatch" ? "identity_mismatch" : "identity_unknown");
+    console.error("[zalo-personal-bridge] startup blocked", {
+      category: accountState === "mismatch" ? "identity_mismatch" : "identity_unknown",
+      accountState,
+    });
+    return;
+  }
 
   zaloClient.onEvent(async (event) => {
+    runtimeStatus.markEventReceived();
     try {
       if (event.type === "undo") {
         if (!event.targetMsgId) {
@@ -724,25 +822,31 @@ async function bootstrap() {
         const recommendedLink = normalizeRecommendedLinkMessage(rawText);
         if (recommendedLink) {
           const baseContent = groupPrefix ? applyGroupPrefix(recommendedLink.content) : recommendedLink.content;
-          const content = derivedIsSelf ? `📱 [Sent from Zalo app]\n${baseContent}` : baseContent;
+          const storedPreview = groupPrefix ? applyGroupPrefix(recommendedLink.preview) : recommendedLink.preview;
+          const mapping = buildRecommendedLinkMapping(
+            { ...recommendedLink, preview: storedPreview },
+            derivedIsSelf,
+            event.quote,
+          );
           console.log("[zalo-recommened-link-detected]", {
-            msgId: event.msgId,
-            threadId: event.threadId,
             isSelf: derivedIsSelf,
-            hasTitle: !!recommendedLink.title,
             hasDescription: !!recommendedLink.description,
             hasHref: !!recommendedLink.href,
-            titlePreview: (recommendedLink.title || "").slice(0, 60) || null,
           });
 
           if (derivedIsSelf) {
+            const replyTarget = await resolveReplyTarget(conversationId, event.targetMsgId);
+            const replyPrefix = replyContextPrefix(event, replyTarget);
             const cwId = await chatwootClient.createAgentMessageFromNative(conversationId, {
-              content,
+              content: `📱 [Sent from Zalo app]\n${replyPrefix}${baseContent}`,
               metadata: { source: "zalo_native", zalo_event: "recommened.link", msgId: event.msgId, threadId: event.threadId },
+              replyToId: replyTarget?.cwId,
+              targetZaloMsgId: event.targetMsgId,
             });
             if (cwId) {
-              messageMap.set(event.msgId, { conversationId, cwId, preview: baseContent.slice(0, 80) });
-              messageStore.set(event.msgId, { conversationId, cwId, preview: baseContent.slice(0, 80) });
+              const entry = { conversationId, cwId, ...mapping };
+              messageMap.set(event.msgId, entry);
+              messageStore.set(event.msgId, entry);
             }
             cache.add(event.msgId);
             return;
@@ -753,8 +857,9 @@ async function bootstrap() {
             metadata: { zalo_event: "recommened.link", msgId: event.msgId, threadId: event.threadId },
           });
           if (cwId) {
-            messageMap.set(event.msgId, { conversationId, cwId, preview: baseContent.slice(0, 80) });
-            messageStore.set(event.msgId, { conversationId, cwId, preview: baseContent.slice(0, 80) });
+            const entry = { conversationId, cwId, ...mapping };
+            messageMap.set(event.msgId, entry);
+            messageStore.set(event.msgId, entry);
           }
           return;
         }
@@ -1227,12 +1332,21 @@ async function bootstrap() {
         const textPart =
           event.text ||
           (event.mediaUrl ? `${event.type.toUpperCase()}: ${event.mediaUrl}` : "Zalo native message");
+        const replyTarget = await resolveReplyTarget(conversationId, event.targetMsgId);
+        const replyPrefix = replyContextPrefix(event, replyTarget);
+
+        console.log("[zalo-native-reply]", {
+          hasReplyTarget: !!event.targetMsgId,
+          replyTargetResolved: !!replyTarget?.cwId,
+        });
 
         cache.addMany([event.msgId, event.text ? contentKey(event.threadId, event.text) : null]);
 
         const cwId = await chatwootClient.createAgentMessageFromNative(conversationId, {
-          content: `${contentPrefix}${textPart}`,
+          content: `${contentPrefix}${replyPrefix}${textPart}`,
           metadata: { source: "zalo_native", msgId: event.msgId, threadId: event.threadId },
+          replyToId: replyTarget?.cwId,
+          targetZaloMsgId: event.targetMsgId,
         });
         if (cwId) {
           messageMap.set(event.msgId, {
@@ -1252,26 +1366,36 @@ async function bootstrap() {
         }
       }
     } catch (err) {
-      console.error("[zalo-personal-bridge] failed to handle event", err);
+      runtimeStatus.setError("event_handler_failed");
+      console.error("[zalo-personal-bridge] failed to handle event", { category: "event_handler_failed" });
     }
   });
 
-  const app = createServer({
-    chatwootClient,
-    zaloClient,
-    cache,
-    inboxId: CHATWOOT_INBOX_ID,
-    threadMap,
-    messageMap,
-    messageStore,
-    mentionsConfigFile: ZALO_MENTIONS_CONFIG_FILE,
-  });
-  app.listen(PORT, () => {
-    console.log(`[zalo-personal-bridge] listening on http://localhost:${PORT}`);
-  });
+  try {
+    await zaloClient.startListener({
+      onConnected: () => {
+        runtimeStatus.markZaloConnected();
+        runtimeStatus.markListenerStarted();
+      },
+      onDisconnected: () => {
+        runtimeStatus.markListenerStopped();
+        runtimeStatus.markZaloDisconnected();
+        runtimeStatus.setError("listener_disconnected");
+      },
+      onError: () => {
+        runtimeStatus.markListenerStopped();
+        runtimeStatus.markZaloDisconnected();
+        runtimeStatus.setError("listener_error");
+      },
+    });
+    console.log("[zalo-personal-bridge] ready", { accountState });
+  } catch (err) {
+    runtimeStatus.setError("listener_start_failed");
+    console.error("[zalo-personal-bridge] startup blocked", { category: "listener_start_failed" });
+  }
 }
 
 bootstrap().catch((err) => {
-  console.error("[zalo-personal-bridge] fatal error", err);
+  console.error("[zalo-personal-bridge] fatal error", { category: "bootstrap_failed" });
   process.exit(1);
 });

@@ -23,6 +23,31 @@ export interface ZaloEvent {
   stickerId?: string;
 }
 
+export function extractQuoteReference(rawQuote: unknown): {
+  targetMsgId?: string;
+  targetPreview?: string;
+} {
+  let quote: any = rawQuote;
+  if (typeof quote === "string") {
+    try {
+      quote = JSON.parse(quote);
+    } catch {
+      return {};
+    }
+  }
+  if (!quote || typeof quote !== "object" || Array.isArray(quote)) return {};
+  const rawTarget = quote.globalMsgId ?? quote.msgId ?? quote.cliMsgId ?? quote.qmsgId ?? quote.qmsgCliId;
+  const targetMsgId = rawTarget === undefined || rawTarget === null ? "" : String(rawTarget).trim();
+  let targetPreview: string | undefined;
+  if (typeof quote.msg === "string" && quote.msg.trim()) targetPreview = quote.msg.trim();
+  else if (typeof quote.content === "string" && quote.content.trim()) targetPreview = quote.content.trim();
+  else if (quote.attach) targetPreview = "Photo";
+  return {
+    ...(targetMsgId ? { targetMsgId } : {}),
+    ...(targetPreview ? { targetPreview } : {}),
+  };
+}
+
 type RichMediaContent = Record<string, any>;
 
 export function parseRichMediaParams(content: RichMediaContent): Record<string, any> {
@@ -92,7 +117,8 @@ export type ZaloMentionPayload = {
 };
 
 export interface ZaloClient {
-  connect(): Promise<void>;
+  authenticate(): Promise<string | null>;
+  startListener(lifecycle?: ZaloListenerLifecycle): Promise<void>;
   onEvent(handler: (event: ZaloEvent) => void): void;
   getSelfUid(): string | null;
   sendText(
@@ -104,10 +130,17 @@ export interface ZaloClient {
   sendImage(threadId: string, imageUrl: string, fileName?: string): Promise<string | null>;
   sendImageBuffer(threadId: string, buffer: Buffer, fileName?: string): Promise<string | null>;
   sendFile(threadId: string, fileUrl: string, fileName?: string): Promise<string | null>;
+  sendDocument(threadId: string, fileUrl: string, fileName?: string): Promise<string | null>;
   resolveStickerUrl(stickerId: string | number): Promise<string | null>;
   fetchProfile(uid: string): Promise<{ displayName?: string; avatarUrl?: string } | null>;
   fetchGroup(threadId: string): Promise<{ name?: string; avatarUrl?: string } | null>;
 }
+
+export type ZaloListenerLifecycle = {
+  onConnected?: () => void;
+  onDisconnected?: () => void;
+  onError?: () => void;
+};
 
 type ZaloClientConfig = {
   imei: string;
@@ -201,23 +234,63 @@ export class ZaloPersonalClient implements ZaloClient {
   private profileLogged = new Set<string>();
   private groupCache = new Map<string, { name?: string; avatarUrl?: string; exp: number }>();
   private selfUid: string | null = null;
+  private listenerHandlersRegistered = false;
 
   constructor(private config: ZaloClientConfig) {}
 
-  async connect(): Promise<void> {
-    if (this.api) return;
+  async authenticate(): Promise<string | null> {
     const stored = await this.loadSession();
     const credentials = normalizeCredentials(this.config, stored);
-
-    const zalo = new Zalo({ selfListen: true, logging: false });
-    this.api = (await this.tryRestoreFromSavedContext(zalo, stored, credentials)) || (await zalo.login(credentials));
-
-    this.api.listener.on("message", (message) => this.handleMessage(message));
-    this.api.listener.on("reaction", (reaction) => this.handleReaction(reaction));
-    this.api.listener.on("undo", (undo) => this.handleUndo(undo));
-    this.api.listener.start();
-
+    if (!this.api) {
+      const zalo = new Zalo({ selfListen: true, logging: false });
+      this.api = (await this.tryRestoreFromSavedContext(zalo, stored, credentials)) || (await zalo.login(credentials));
+    }
+    const accountInfo = await this.api.fetchAccountInfo();
+    const provenUid = accountInfo?.profile?.userId;
+    this.selfUid = typeof provenUid === "string" && provenUid.trim() ? provenUid.trim() : null;
     await this.persistSession(credentials);
+    return this.selfUid;
+  }
+
+  async startListener(lifecycle: ZaloListenerLifecycle = {}): Promise<void> {
+    if (!this.api) throw new Error("Zalo client not authenticated");
+    if (this.listenerHandlersRegistered) return;
+    this.listenerHandlersRegistered = true;
+    const listener = this.api.listener;
+    listener.on("message", (message) => this.handleMessage(message));
+    listener.on("reaction", (reaction) => this.handleReaction(reaction));
+    listener.on("undo", (undo) => this.handleUndo(undo));
+    await new Promise<void>((resolve, reject) => {
+      let initialConnectionPending = true;
+      const timeout = setTimeout(() => {
+        if (!initialConnectionPending) return;
+        initialConnectionPending = false;
+        reject(new Error("Zalo listener connection timeout"));
+      }, 30_000);
+      listener.on("connected", () => {
+        lifecycle.onConnected?.();
+        if (!initialConnectionPending) return;
+        initialConnectionPending = false;
+        clearTimeout(timeout);
+        resolve();
+      });
+      listener.on("disconnected", () => lifecycle.onDisconnected?.());
+      listener.on("closed", () => {
+        lifecycle.onDisconnected?.();
+        if (!initialConnectionPending) return;
+        initialConnectionPending = false;
+        clearTimeout(timeout);
+        reject(new Error("Zalo listener closed before connecting"));
+      });
+      listener.on("error", () => lifecycle.onError?.());
+      try {
+        listener.start({ retryOnClose: true });
+      } catch (error) {
+        initialConnectionPending = false;
+        clearTimeout(timeout);
+        reject(error);
+      }
+    });
   }
 
   onEvent(handler: (event: ZaloEvent) => void): void {
@@ -429,8 +502,18 @@ export class ZaloPersonalClient implements ZaloClient {
     }
   }
 
+  async sendDocument(threadId: string, fileUrl: string, fileName?: string): Promise<string | null> {
+    return this.sendFile(threadId, fileUrl, fileName);
+  }
+
   private emit(event: ZaloEvent) {
-    bridgeLogger.log("[zalo-event]", JSON.stringify(event));
+    bridgeLogger.log("[zalo-event]", {
+      type: event.type,
+      isSelf: event.isSelf,
+      hasText: !!event.text,
+      hasMedia: !!event.mediaUrl,
+      hasQuote: !!event.quote,
+    });
     this.handlers.forEach((h) => h(event));
   }
 
@@ -441,11 +524,11 @@ export class ZaloPersonalClient implements ZaloClient {
       const first = details?.[0];
       const url = first?.stickerUrl || first?.stickerWebpUrl || first?.stickerSpriteUrl;
       if (url) {
-        bridgeLogger.log("[zalo-sticker-url-resolved]", { stickerId, url });
+        bridgeLogger.log("[zalo-sticker-url-resolved]", { resolved: true });
         return url;
       }
     } catch (err) {
-      bridgeLogger.warn("[zalo-sticker-error]", err);
+      bridgeLogger.warn("[zalo-sticker-error]", { category: "sticker_lookup_failed" });
     }
     return null;
   }
@@ -465,22 +548,7 @@ export class ZaloPersonalClient implements ZaloClient {
     const threadDisplayName: string | undefined =
       (message as any).threadName || data.threadName || data.thread_name || data.groupName || data.group_name || undefined;
     const avatarUrl: string | undefined = data.avatar || data.avatarUrl;
-    const quote: any = data.quote || undefined;
-    const targetMsgId =
-      quote?.globalMsgId ??
-      quote?.msgId ??
-      quote?.cliMsgId ??
-      quote?.qmsgId ??
-      quote?.qmsgCliId ??
-      undefined;
-    let targetPreview: string | undefined;
-    if (typeof quote?.msg === "string") {
-      targetPreview = quote.msg;
-    } else if (typeof quote?.content === "string") {
-      targetPreview = quote.content;
-    } else if (quote?.attach) {
-      targetPreview = "Photo";
-    }
+    const { targetMsgId, targetPreview } = extractQuoteReference(data.quote);
     const base = {
       threadId: String(message.threadId),
       msgId,
@@ -700,11 +768,12 @@ export class ZaloPersonalClient implements ZaloClient {
 
       const api = new apisModule.API(ctx, saved.loginInfo.zpw_service_map_v3, saved.loginInfo.zpw_ws) as API;
       await (api as any).fetchAccountInfo?.();
-      if (saved.selfUid) this.selfUid = saved.selfUid;
       bridgeLogger.log("[zalo-personal-bridge] restored API from saved session context");
       return api;
     } catch (err) {
-      bridgeLogger.warn("[zalo-personal-bridge] failed to restore saved context", (err as Error).message);
+      bridgeLogger.warn("[zalo-personal-bridge] failed to restore saved context", {
+        category: "session_restore_failed",
+      });
       return null;
     }
   }
@@ -810,7 +879,9 @@ export class ZaloPersonalClient implements ZaloClient {
       await fs.promises.mkdir(path.dirname(this.config.sessionFile), { recursive: true });
       await fs.promises.writeFile(this.config.sessionFile, JSON.stringify(payload, null, 2), "utf8");
     } catch (err) {
-      bridgeLogger.warn("[zalo-personal-bridge] failed to persist session", err);
+      bridgeLogger.warn("[zalo-personal-bridge] failed to persist session", {
+        category: "session_persist_failed",
+      });
     }
   }
 

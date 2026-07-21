@@ -19,6 +19,10 @@ This is an unofficial integration using an unofficial Zalo Personal API. Account
 - Stores message mappings in `data/message-map.json` so replies can become native Zalo quotes.
 - Mirrors Zalo message recalls to the exact mapped Chatwoot message.
 - Supports optional `[[zalo:alias]]` markers for group mentions.
+- Renders Zalo link-card payloads as readable title, description, and safe HTTP(S) URL text.
+- Preserves native reply context in Chatwoot with `reply_to` and `content_attributes.in_reply_to`.
+- Rejects malformed thread identifiers before any Zalo SDK send.
+- Exposes readiness health without account UIDs, tokens, cookies, device IDs, or contact/thread IDs.
 
 ## Limitations
 
@@ -65,6 +69,7 @@ https://bridge.example.com/webhooks/chatwoot
 | Variable | Required | Purpose |
 | --- | --- | --- |
 | `PORT` | no | HTTP port, default `4001`. |
+| `HTTP_ROUTE_PREFIXES` | no | Comma-separated optional route prefixes. Each adds `<prefix>/health` and `<prefix>/callback`. |
 | `CHATWOOT_BASE_URL` | yes | Chatwoot base URL, for example `https://chatwoot.example.com`. |
 | `CHATWOOT_API_TOKEN` | yes | Chatwoot user access token with inbox/conversation permissions. |
 | `CHATWOOT_ACCOUNT_ID` | yes | Numeric Chatwoot account ID. |
@@ -79,7 +84,16 @@ https://bridge.example.com/webhooks/chatwoot
 | `ZALO_LANGUAGE` | no | Zalo language, default `vi`. |
 | `ZALO_COOKIE_JSON` | yes | Zalo cookies as JSON. `npm run login:qr` can populate it. |
 | `ZALO_SESSION_FILE` | no | Session context path, default `./data/session.json`. |
+| `ZALO_EXPECTED_SELF_UID` | no | Optional private account guard. A mismatch keeps health and callbacks not-ready. |
 | `ZALO_MENTIONS_CONFIG_FILE` | no | Optional mention config path. |
+
+## Readiness and account guard
+
+The HTTP server starts before Zalo authentication so operators can inspect health during startup. `/health` returns HTTP `503` until authentication succeeds, the listener reports `connected`, and `ZALO_EXPECTED_SELF_UID` matches when configured. Chatwoot callback routes are also blocked with `503` while not ready.
+
+Set `ZALO_EXPECTED_SELF_UID` only in the private runtime `.env` after independently verifying the connected account. Leave it empty in examples and never print or commit a real value. Health includes readiness, account-match state, timestamps, and Chatwoot account/inbox mapping, but excludes authentication and contact identifiers.
+
+Optional `HTTP_ROUTE_PREFIXES=/bridge-a,/bridge-b` adds `/bridge-a/health`, `/bridge-a/callback`, `/bridge-b/health`, and `/bridge-b/callback`. The portable defaults remain `/health`, `/callback`, and `/webhooks/chatwoot`.
 
 ## Chatwoot Setup
 

@@ -400,9 +400,53 @@ export function normalizeRecommendedUserMessage(
   };
 }
 
-export function normalizeRecommendedLinkMessage(
-  rawText: string,
-): { content: string; title?: string; description?: string; href?: string; thumb?: string; mediaTitle?: string } | null {
+export type RecommendedLinkMessage = {
+  content: string;
+  preview: string;
+  title: string;
+  description?: string;
+  href?: string;
+};
+
+const normalizeHumanText = (value: unknown): string | undefined => {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) return undefined;
+  if (/^(?:\{|\[).*(?:\}|\])$/s.test(normalized)) return undefined;
+  if (/(?:\/storage\/emulated|content:\/\/|file:\/\/)/i.test(normalized)) return undefined;
+  return normalized;
+};
+
+const normalizeHttpUrl = (value: unknown): string | undefined => {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim().replace(/\\\//g, "/");
+  if (!normalized || /\s/.test(normalized)) return undefined;
+  try {
+    const parsed = new URL(normalized);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return undefined;
+    return parsed.href;
+  } catch {
+    return undefined;
+  }
+};
+
+const urlFromTitle = (title: string | undefined): string | undefined => {
+  if (!title) return undefined;
+  const match = title.match(/https?:\/\/[^\s<>"']+/i)?.[0];
+  if (!match) return undefined;
+  return normalizeHttpUrl(match.replace(/[),.;!?]+$/, ""));
+};
+
+const withoutUrl = (value: string | undefined, url: string | undefined): string | undefined => {
+  if (!value || !url) return value;
+  const candidate = value.match(/https?:\/\/[^\s<>"']+/i)?.[0];
+  if (!candidate) return value;
+  const candidateUrl = normalizeHttpUrl(candidate.replace(/[),.;!?]+$/, ""));
+  if (!candidateUrl || candidateUrl.toLowerCase() !== url.toLowerCase()) return value;
+  return normalizeHumanText(value.replace(candidate, "").replace(/\s+([,.;:!?])/g, "$1").replace(/[-–—,:;]+$/, ""));
+};
+
+export function normalizeRecommendedLinkMessage(rawText: string): RecommendedLinkMessage | null {
   const trimmed = rawText.trim();
   if (!trimmed) return null;
 
@@ -412,76 +456,55 @@ export function normalizeRecommendedLinkMessage(
   } catch {
     return null;
   }
+  if (!outer || outer.action !== "recommened.link") return null;
 
-  if (!outer || outer.action !== "recommened.link") {
-    return null;
-  }
-
-  const title: string | undefined = typeof outer?.title === "string" ? outer.title.trim() : undefined;
-  const description: string | undefined = typeof outer?.description === "string" ? outer.description.trim() : undefined;
-  const href: string | undefined = typeof outer?.href === "string" ? outer.href.trim() : undefined;
-  const thumb: string | undefined = typeof outer?.thumb === "string" ? outer.thumb.trim() : undefined;
-
-  let inner: any = null;
-  if (typeof outer?.params === "string") {
+  let params: any = null;
+  if (typeof outer.params === "string") {
     try {
-      inner = JSON.parse(outer.params);
+      const parsed = JSON.parse(outer.params);
+      params = parsed && typeof parsed === "object" ? parsed : null;
     } catch {
-      inner = null;
+      params = null;
     }
-  } else if (outer?.params && typeof outer.params === "object") {
-    inner = outer.params;
+  } else if (outer.params && typeof outer.params === "object") {
+    params = outer.params;
   }
 
-  const mediaTitle: string | undefined = typeof inner?.mediaTitle === "string" ? inner.mediaTitle.trim() : undefined;
+  const outerTitle = normalizeHumanText(outer.title);
+  const extractedTitleUrl = urlFromTitle(outerTitle);
+  const href = normalizeHttpUrl(outer.href) || normalizeHttpUrl(params?.href) || extractedTitleUrl;
+  const authoredTitle = withoutUrl(outerTitle, extractedTitleUrl);
+  const mediaTitle = normalizeHumanText(params?.mediaTitle);
+  const title = authoredTitle || mediaTitle || "Shared link";
 
-  // Use mediaTitle if available, otherwise fall back to description or title
-  const displayTitle = mediaTitle || description || title || "Link";
-  const parts: string[] = [`🔗 [Link Preview]`];
+  const rawDescription = normalizeHumanText(outer.description);
+  const descriptionWithoutUrl = withoutUrl(rawDescription, href);
+  const description =
+    descriptionWithoutUrl && descriptionWithoutUrl.toLowerCase() !== title.toLowerCase()
+      ? descriptionWithoutUrl
+      : undefined;
 
-  if (displayTitle && displayTitle.length) {
-    parts.push(displayTitle);
-  }
-
-  if (href && href.length) {
-    parts.push(href);
-  }
-
-  const content = parts.join("\n");
-  if (!content || !content.trim()) {
-    console.log("[zalo-recommened-link-error]", {
-      reason: "invalid-structure",
-      debug: {
-        action: "recommened.link",
-        hasTitle: !!title,
-        hasDescription: !!description,
-        hasHref: !!href,
-        hasThumb: !!thumb,
-        hasMediaTitle: !!mediaTitle,
-        titlePreview: title ? title.slice(0, 60) : undefined,
-        descriptionPreview: description ? description.slice(0, 60) : undefined,
-        hrefPreview: href ? href.slice(0, 80) : undefined,
-      },
-    });
-    return { content: "🔗 [Link Preview] (unparsed)" };
-  }
-
-  if (!href) {
-    console.log("[zalo-recommened-link-no-href]", {
-      action: "recommened.link",
-      hasTitle: !!title,
-      hasDescription: !!description,
-      hasMediaTitle: !!mediaTitle,
-      titlePreview: title ? title.slice(0, 60) : undefined,
-    });
-  }
+  const parts = [`🔗 ${title}`];
+  if (description) parts.push(description);
+  if (href) parts.push(href);
 
   return {
-    content,
+    content: parts.join("\n\n"),
+    preview: href ? `${title} — ${href}` : title,
     title,
     description,
     href,
-    thumb,
-    mediaTitle,
+  };
+}
+
+export function buildRecommendedLinkMapping(
+  normalized: RecommendedLinkMessage,
+  isSelf: boolean,
+  quote?: Record<string, unknown>,
+): { preview: string; sender: "self" | "contact"; quote?: Record<string, unknown> } {
+  return {
+    preview: normalized.preview,
+    sender: isSelf ? "self" : "contact",
+    quote,
   };
 }

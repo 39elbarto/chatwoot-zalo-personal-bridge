@@ -46,6 +46,31 @@ export type ChatwootConfig = {
 
 export type AttachmentPayload = { url: string; fileType: string; fileName?: string };
 
+export type NativeAgentMessagePayload = {
+  content: string;
+  metadata?: Record<string, unknown>;
+  replyToId?: number | null;
+  targetZaloMsgId?: string;
+};
+
+export function buildNativeAgentMessageBody(payload: NativeAgentMessagePayload) {
+  return {
+    content: payload.content,
+    message_type: "outgoing",
+    private: true,
+    status: "sent",
+    content_type: "text",
+    additional_attributes: {
+      source: "zalo_native",
+      ...(payload.metadata || {}),
+      ...(payload.targetZaloMsgId ? { target_zalo_msg_id: payload.targetZaloMsgId } : {}),
+    },
+    ...(payload.replyToId
+      ? { reply_to: payload.replyToId, content_attributes: { in_reply_to: payload.replyToId } }
+      : {}),
+  };
+}
+
 export class ChatwootClient {
   constructor(private cfg: ChatwootConfig) {}
 
@@ -114,9 +139,9 @@ export class ChatwootClient {
         .map((p) => this.normalizePrefix(p, ""))
         .filter((p) => p && p !== this.contactIdentifierPrefix());
     }
-    // Preserve previous behavior for the default instance only.
+    // Preserve the legacy public default for existing installations.
     if (this.contactIdentifierPrefix() === "zalo:") return ["zalo2:"];
-    // For non-default instances (e.g., zalo3:), default to no legacy reuse to avoid cross-inbox collisions.
+    // Custom instances require explicit legacy prefixes to avoid cross-inbox collisions.
     return [];
   }
 
@@ -795,21 +820,14 @@ export class ChatwootClient {
 
   async createAgentMessageFromNative(
     conversationId: number,
-    payload: { content: string; metadata?: Record<string, unknown> },
+    payload: NativeAgentMessagePayload,
   ): Promise<number | null> {
     const res = await this.request(
       `/api/v1/accounts/${this.cfg.accountId}/conversations/${conversationId}/messages`,
       {
         method: "POST",
         headers: this.headers(),
-        body: JSON.stringify({
-          content: payload.content,
-          message_type: "outgoing",
-          private: true,
-          status: "sent",
-          content_type: "text",
-          additional_attributes: { source: "zalo_native", ...(payload.metadata || {}) },
-        }),
+        body: JSON.stringify(buildNativeAgentMessageBody(payload)),
       },
       "createAgentMessageFromNative",
     );
