@@ -138,8 +138,8 @@ export interface ZaloClient {
 
 export type ZaloListenerLifecycle = {
   onConnected?: () => void;
-  onDisconnected?: () => void;
-  onError?: () => void;
+  onDisconnected?: (code?: number, reason?: unknown) => void;
+  onError?: (error?: unknown) => void;
 };
 
 type ZaloClientConfig = {
@@ -274,15 +274,15 @@ export class ZaloPersonalClient implements ZaloClient {
         clearTimeout(timeout);
         resolve();
       });
-      listener.on("disconnected", () => lifecycle.onDisconnected?.());
-      listener.on("closed", () => {
-        lifecycle.onDisconnected?.();
+      listener.on("disconnected", (code, reason) => lifecycle.onDisconnected?.(code, reason));
+      listener.on("closed", (code, reason) => {
+        lifecycle.onDisconnected?.(code, reason);
         if (!initialConnectionPending) return;
         initialConnectionPending = false;
         clearTimeout(timeout);
         reject(new Error("Zalo listener closed before connecting"));
       });
-      listener.on("error", () => lifecycle.onError?.());
+      listener.on("error", (error) => lifecycle.onError?.(error));
       try {
         listener.start({ retryOnClose: true });
       } catch (error) {

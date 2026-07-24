@@ -124,6 +124,10 @@ curl -fsS http://127.0.0.1:${PORT:-4001}/health
 {"ok":true,"readiness":"ready","zalo_connected":true,"listener_started":true,"account_match":true}
 ```
 
+The listener watchdog exits the process after 90 seconds of continuous
+disconnection. The service manager must use a restart policy. A reconnect
+before the deadline cancels the restart request and preserves the process.
+
 - Build and tests:
 
 ```bash

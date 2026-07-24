@@ -68,6 +68,8 @@
 - `unknown_with_expectation`: the account-info request did not prove an identity while an expected UID is configured.
 - `zalo_connected=false` or `listener_started=false`: inspect listener lifecycle logs and session validity.
 - `last_error_category` is intentionally categorical; sensitive SDK/API payloads are not returned by health.
+- `[zalo-listener] unavailable; recovery watchdog started`: the listener is down and the SDK is still allowed to reconnect.
+- `[zalo-listener] recovery timeout; requesting supervisor restart`: the recovery deadline elapsed. Confirm the supervisor restarted the process and `/health` returned to HTTP 200 before considering QR login.
 
 ## Link Card Is Raw JSON
 

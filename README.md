@@ -85,11 +85,17 @@ https://bridge.example.com/webhooks/chatwoot
 | `ZALO_COOKIE_JSON` | yes | Zalo cookies as JSON. `npm run login:qr` can populate it. |
 | `ZALO_SESSION_FILE` | no | Session context path, default `./data/session.json`. |
 | `ZALO_EXPECTED_SELF_UID` | no | Optional private account guard. A mismatch keeps health and callbacks not-ready. |
+| `ZALO_LISTENER_RECOVERY_TIMEOUT_MS` | no | Listener recovery deadline in milliseconds. Defaults to `90000`; allowed range is `10000` to `900000`. |
 | `ZALO_MENTIONS_CONFIG_FILE` | no | Optional mention config path. |
 
 ## Readiness and account guard
 
 The HTTP server starts before Zalo authentication so operators can inspect health during startup. `/health` returns HTTP `503` until authentication succeeds, the listener reports `connected`, and `ZALO_EXPECTED_SELF_UID` matches when configured. Chatwoot callback routes are also blocked with `503` while not ready.
+
+If the SDK listener disconnects, the bridge keeps the SDK retry behavior active
+for 90 seconds. A successful reconnect cancels the watchdog. If the listener is
+still unavailable at the deadline, the process exits with status 1 so systemd,
+Docker, or another supervisor can restart it with the saved session.
 
 Set `ZALO_EXPECTED_SELF_UID` only in the private runtime `.env` after independently verifying the connected account. Leave it empty in examples and never print or commit a real value. Health includes readiness, account-match state, timestamps, and Chatwoot account/inbox mapping, but excludes authentication and contact identifiers.
 

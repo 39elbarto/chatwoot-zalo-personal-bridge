@@ -7,6 +7,7 @@ import { contentKey } from "./messageKeys";
 import { MessageMapStore } from "./messageMapStore";
 import { MappingAwareMap, RecallCoordinator } from "./recallCoordinator";
 import { RuntimeStatus, resolveAccountIdentityState } from "./runtimeStatus";
+import { ListenerRecoveryWatchdog, resolveListenerRecoveryTimeout } from "./listenerRecovery";
 import {
   normalizeActionlistSystemMessage,
   normalizeCalltimeSystemMessage,
@@ -38,6 +39,7 @@ const ZALO_COOKIE_JSON = process.env.ZALO_COOKIE_JSON || "";
 const ZALO_SESSION_FILE = process.env.ZALO_SESSION_FILE || "./data/session.json";
 const ZALO_MENTIONS_CONFIG_FILE = process.env.ZALO_MENTIONS_CONFIG_FILE || "./data/zalo-mentions.json";
 const ZALO_EXPECTED_SELF_UID = process.env.ZALO_EXPECTED_SELF_UID || "";
+const ZALO_LISTENER_RECOVERY_TIMEOUT_RAW = process.env.ZALO_LISTENER_RECOVERY_TIMEOUT_MS;
 
 async function bootstrap() {
   const cache = new OutgoingCache();
@@ -147,6 +149,18 @@ async function bootstrap() {
   ) {
     runtimeStatus.setError("configuration_invalid");
     console.error("[zalo-personal-bridge] startup blocked", { category: "configuration_invalid" });
+    return;
+  }
+
+  let listenerRecoveryTimeoutMs: number;
+  try {
+    listenerRecoveryTimeoutMs = resolveListenerRecoveryTimeout(ZALO_LISTENER_RECOVERY_TIMEOUT_RAW);
+  } catch (err) {
+    runtimeStatus.setError("configuration_invalid");
+    console.error("[zalo-personal-bridge] startup blocked", {
+      category: "configuration_invalid",
+      field: "ZALO_LISTENER_RECOVERY_TIMEOUT_MS",
+    });
     return;
   }
 
@@ -1371,21 +1385,30 @@ async function bootstrap() {
     }
   });
 
+  const listenerRecovery = new ListenerRecoveryWatchdog({
+    timeoutMs: listenerRecoveryTimeoutMs,
+    logger: console,
+    onTimeout: () => process.exit(1),
+  });
+
   try {
     await zaloClient.startListener({
       onConnected: () => {
+        listenerRecovery.connected();
         runtimeStatus.markZaloConnected();
         runtimeStatus.markListenerStarted();
       },
-      onDisconnected: () => {
+      onDisconnected: (code, reason) => {
         runtimeStatus.markListenerStopped();
         runtimeStatus.markZaloDisconnected();
         runtimeStatus.setError("listener_disconnected");
+        listenerRecovery.unavailable("disconnected", code, reason);
       },
       onError: () => {
         runtimeStatus.markListenerStopped();
         runtimeStatus.markZaloDisconnected();
         runtimeStatus.setError("listener_error");
+        listenerRecovery.unavailable("error");
       },
     });
     console.log("[zalo-personal-bridge] ready", { accountState });
