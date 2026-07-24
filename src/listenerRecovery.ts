@@ -81,7 +81,11 @@ export class ListenerRecoveryWatchdog {
     },
   ) {}
 
-  unavailable(trigger: ListenerRecoveryTrigger, code?: unknown, reason?: unknown): void {
+  unavailable(
+    trigger: ListenerRecoveryTrigger,
+    code: unknown = undefined,
+    reason: unknown = undefined,
+  ): void {
     const details: ListenerDisconnectDetails = {
       trigger,
       code: normalizeCode(code),

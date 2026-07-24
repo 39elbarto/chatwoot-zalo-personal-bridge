@@ -138,8 +138,8 @@ export interface ZaloClient {
 
 export type ZaloListenerLifecycle = {
   onConnected?: () => void;
-  onDisconnected?: (code?: number, reason?: unknown) => void;
-  onError?: (error?: unknown) => void;
+  onDisconnected?: (code: number | undefined, reason: unknown) => void;
+  onError?: (error: unknown) => void;
 };
 
 type ZaloClientConfig = {
