@@ -7,6 +7,7 @@ export type AccountIdentityState =
 export type RuntimeErrorCategory =
   | "configuration_invalid"
   | "storage_initialization_failed"
+  | "outbound_queue_failed"
   | "authentication_failed"
   | "identity_unknown"
   | "identity_mismatch"

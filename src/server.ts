@@ -1,11 +1,12 @@
 import express from "express";
 import { ChatwootClient, type AttachmentPayload } from "./chatwootClient";
-import { ZaloClient } from "./zaloClient";
+import { isZaloApiFetchTimeout, isZaloUploadCallbackTimeout, isZaloUploadConfirmationCooldown, ZaloClient } from "./zaloClient";
 import { OutgoingCache } from "./outgoingCache";
 import { contentKey } from "./messageKeys";
 import type { MessageMapStore } from "./messageMapStore";
 import { ZaloMentionResolver } from "./zaloMentions";
 import type { RuntimeStatus } from "./runtimeStatus";
+import { OutboundDeliveryError, OutboundDeliveryQueue, type OutboundQueueJob, type OutboundQueueItem } from "./outboundDeliveryQueue";
 
 export type ServerDeps = {
   chatwootClient: ChatwootClient;
@@ -15,6 +16,7 @@ export type ServerDeps = {
   threadMap: Map<number, string>;
   messageMap: Map<string, { conversationId: number; cwId: number; preview: string; sender?: "self" | "contact"; quote?: Record<string, unknown> }>;
   messageStore?: MessageMapStore;
+  outboundQueue: OutboundDeliveryQueue;
   mentionsConfigFile?: string;
   runtimeStatus: RuntimeStatus;
   threadIdPrefixes?: readonly string[];
@@ -193,6 +195,7 @@ export function createServer({
   threadMap,
   messageMap,
   messageStore,
+  outboundQueue,
   mentionsConfigFile,
   runtimeStatus,
   threadIdPrefixes = ["zalo:"],
@@ -200,12 +203,131 @@ export function createServer({
 }: ServerDeps) {
   const app = express();
   const mentionResolver = new ZaloMentionResolver(mentionsConfigFile || "./data/zalo-mentions.json");
-  const sendDocument = zaloClient.sendDocument.bind(zaloClient);
   app.use(express.json({ limit: "20mb" }));
+
+  outboundQueue.setTerminalHandler(async (job) => {
+    const attachmentIssue = job.items.some((item) => item.kind !== "text" && (item.state === "failed" || item.state === "unknown"));
+    const unknown = job.items.some((item) => item.state === "unknown");
+    const failed = job.items.some((item) => item.state === "failed");
+    const accepted = job.items.some((item) => item.state === "accepted");
+    const subject = attachmentIssue ? "Attachment sending" : "Message sending";
+    const outcome = unknown && failed ? "failed, and another outcome is unknown" : unknown ? "has an unknown outcome" : "failed";
+    const cooldown = job.items.some((item) => item.failureCategory === "zalo_upload_confirmation_cooldown");
+    const detail = cooldown && !unknown
+      ? `${accepted ? "Some content was accepted by Zalo. " : ""}Attachment upload is temporarily paused and was not sent. Retry after five minutes.`
+      : `${accepted ? "Some content was accepted by Zalo. " : ""}${subject} ${outcome}.`;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        await chatwootClient.markOutboundFailed(job.conversationId, job.messageId, detail);
+        return;
+      } catch {
+        if (attempt === 2) throw new Error("chatwoot_status_write_failed");
+        await new Promise((resolve) => setTimeout(resolve, 1000 * 2 ** attempt));
+      }
+    }
+  });
+
+  outboundQueue.setProcessor(async (job: Readonly<OutboundQueueJob>, item: Readonly<OutboundQueueItem>) => {
+    if (item.kind === "text") {
+      const text = item.text || "";
+      let zaloMessageId: string | null;
+      try {
+        zaloMessageId = await zaloClient.sendText(job.threadId, text, item.quote, item.mentions);
+      } catch (error) {
+        runtimeStatus.setError("zalo_text_send_failed");
+        if (isZaloApiFetchTimeout(error)) {
+          throw new OutboundDeliveryError("zalo_api_fetch_timeout", "unknown");
+        }
+        throw new OutboundDeliveryError("zalo_text_outcome_unknown", "unknown");
+      }
+      if (!zaloMessageId) {
+        runtimeStatus.setError("zalo_text_send_failed");
+        throw new OutboundDeliveryError("zalo_text_outcome_unknown", "unknown");
+      }
+      runtimeStatus.markOutboundZaloSend();
+      cache.addMany([zaloMessageId, cwTextKey(job.threadId, text)]);
+      const entry = {
+        conversationId: job.conversationId,
+        cwId: job.messageId,
+        preview: text.slice(0, 80),
+        sender: "self",
+      } as const;
+      messageMap.set(zaloMessageId, entry);
+      messageStore?.set(zaloMessageId, entry);
+      return { zaloMessageId };
+    }
+
+    if (!item.url) {
+      runtimeStatus.setError("attachment_fetch_failed");
+      throw new OutboundDeliveryError("attachment_url_missing", "failed");
+    }
+    const url = item.url;
+    let head: Response;
+    try {
+      head = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(15_000) });
+    } catch {
+      runtimeStatus.setError("attachment_fetch_failed");
+      throw new OutboundDeliveryError("attachment_head_failed", "retryable");
+    }
+    if (!head.ok) {
+      runtimeStatus.setError("attachment_fetch_failed");
+      const retryable = head.status === 408 || head.status === 429 || head.status >= 500;
+      throw new OutboundDeliveryError("attachment_head_status", retryable ? "retryable" : "failed");
+    }
+    let filename = item.fileName || undefined;
+    if (!filename) {
+      try {
+        const last = new URL(url).pathname.split("/").pop() || "";
+        filename = last ? decodeURIComponent(last) : undefined;
+      } catch {
+        filename = undefined;
+      }
+    }
+    filename = sanitizeAttachmentFileName(filename);
+    if (filename) {
+      cache.add(attachmentEchoKey(job.threadId, filename));
+      cache.addWithTtl(recentAttachmentKey(job.threadId, filename), 60_000);
+    }
+
+    let zaloMessageId: string | null;
+    try {
+      zaloMessageId = item.kind === "image"
+        ? await zaloClient.sendImage(job.threadId, url, filename)
+        : await zaloClient.sendDocument(job.threadId, url, filename);
+    } catch (error) {
+      runtimeStatus.setError(item.kind === "image" ? "zalo_image_send_failed" : "zalo_file_send_failed");
+      if (isZaloApiFetchTimeout(error)) {
+        throw new OutboundDeliveryError("zalo_api_fetch_timeout", "unknown");
+      }
+      if (isZaloUploadCallbackTimeout(error)) {
+        throw new OutboundDeliveryError("zalo_upload_callback_timeout", "retryable");
+      }
+      if (isZaloUploadConfirmationCooldown(error)) {
+        throw new OutboundDeliveryError("zalo_upload_confirmation_cooldown", item.kind === "file" ? "failed" : "unknown");
+      }
+      throw new OutboundDeliveryError("zalo_attachment_outcome_unknown", "unknown");
+    }
+    if (!zaloMessageId) {
+      runtimeStatus.setError(item.kind === "image" ? "zalo_image_send_failed" : "zalo_file_send_failed");
+      throw new OutboundDeliveryError("zalo_attachment_outcome_unknown", "unknown");
+    }
+
+    runtimeStatus.markOutboundZaloSend();
+    cache.addMany([zaloMessageId, filename ? attachmentEchoKey(job.threadId, filename) : null]);
+    const entry = {
+      conversationId: job.conversationId,
+      cwId: job.messageId,
+      preview: item.kind === "image" ? "Image" : "File",
+      sender: "self",
+    } as const;
+    messageMap.set(zaloMessageId, entry);
+    messageStore?.set(zaloMessageId, entry);
+    return { zaloMessageId };
+  });
 
   const healthHandler = (_req: express.Request, res: express.Response) => {
     const health = runtimeStatus.health();
-    return res.status(health.ok ? 200 : 503).json(health);
+    return res.status(health.ok ? 200 : 503).json({ ...health, outbound_queue: outboundQueue.healthSummary() });
   };
   const normalizedRoutePrefixes = normalizeRoutePrefixes(routePrefixes);
   for (const path of ["/health", ...normalizedRoutePrefixes.map((prefix) => `${prefix}/health`)]) {
@@ -259,6 +381,38 @@ export function createServer({
       const conversationId = msg?.conversation_id || conversation?.id;
 
       const eventName = typeof raw?.event === "string" ? raw.event : "";
+      if (eventName === "message_updated") {
+        const messageId = Number(msg?.id);
+        const targetConversation = Number(conversationId);
+        if (!Number.isSafeInteger(messageId) || messageId <= 0 || messageId >= Number.MAX_SAFE_INTEGER ||
+            !Number.isSafeInteger(targetConversation) || targetConversation <= 0 ||
+            (inboxIdFromPayload && Number(inboxIdFromPayload) !== inboxId)) {
+          return res.json({success: true, skipped: "retry_identity"});
+        }
+        const retryState = await outboundQueue.retryState(targetConversation, messageId);
+        if (!retryState) return res.json({success: true, skipped: "retry_not_eligible"});
+        let current: Record<string, any> | null;
+        try {
+          current = await chatwootClient.getMessageForRetry(targetConversation, messageId);
+        } catch {
+          return res.status(503).json({success: false, error: "retry_read_failed"});
+        }
+        if (!current || current.id !== messageId || current.conversation_id !== targetConversation ||
+            current.inbox_id !== inboxId || ![1, "outgoing"].includes(current.message_type) ||
+            current.private !== false || current.deleted === true || current.content_attributes?.deleted === true ||
+            current.status !== "sent") return res.json({success: true, skipped: "retry_not_confirmed"});
+        try {
+          if (retryState.state === "pending") {
+            await outboundQueue.reassertPendingRetry(targetConversation, messageId, retryState.generation);
+            return res.json({success: true, retry: "reassert"});
+          }
+          const result = await outboundQueue.applyNativeRetry(targetConversation, messageId, retryState.generation);
+          return res.json({success: true, retry: result});
+        } catch {
+          runtimeStatus.setError("outbound_queue_failed");
+          return res.status(503).json({success: false, error: "retry_queue_unavailable"});
+        }
+      }
       if (eventName && eventName !== "message_created") {
         return res.json({ success: true, skipped: "unsupported_event" });
       }
@@ -266,10 +420,6 @@ export function createServer({
       console.log("[chatwoot-callback] incoming", {
         event: raw?.event,
         messageType,
-        inboxId: inboxIdFromPayload,
-        conversationId,
-        private: msg?.private,
-        source: msg?.additional_attributes?.source,
       });
 
       if (inboxIdFromPayload && inboxIdFromPayload !== inboxId) {
@@ -346,18 +496,12 @@ export function createServer({
           fileType: attachmentType(att),
           fileName: att.file_name || att.filename || att.name,
         })) || [];
-      const cwMessageId: number | null = typeof msg?.id === "number" ? msg.id : null;
-
-      const dedupeKey = `cw:${conversationId || "unknown"}:${msg?.id || ""}`;
-      if (cache.has(dedupeKey)) {
-        console.log("[chatwoot-callback] skip duplicate", { dedupeKey });
-        return res.json({ success: true, skipped: "duplicate" });
+      const normalizedConversationId = Number(conversationId);
+      const cwMessageId = Number(msg?.id);
+      if (!Number.isSafeInteger(normalizedConversationId) || normalizedConversationId <= 0 || !Number.isSafeInteger(cwMessageId) || cwMessageId <= 0) {
+        console.warn("[chatwoot-callback] outbound identity missing", { category: "missing_message_identity" });
+        return res.status(422).json({ success: false, error: "missing_message_identity" });
       }
-      // Pre-add dedupe key to avoid retries causing duplicates if Zalo send is slow.
-      cache.add(dedupeKey);
-
-      // Always respond quickly to Chatwoot to avoid 502/retries and "Failed to send" UI.
-      res.json({ success: true, queued: true });
 
       const trimmedContent = typeof content === "string" ? content.trim() : "";
       const textForZalo = messageType === "template" ? normalizeTemplateTextForZalo(trimmedContent) : trimmedContent;
@@ -365,7 +509,6 @@ export function createServer({
       const finalTextForZalo = mentionResult?.text || textForZalo;
       const mentionsForZalo = mentionResult?.mentions || [];
       const hasText = !!finalTextForZalo;
-      const tasks: Array<Promise<void>> = [];
       const contentAttrs = parseAttrs(msg?.content_attributes || msg?.contentAttributes);
       const replyToId = Number(contentAttrs?.in_reply_to || contentAttrs?.reply_to || msg?.reply_to || 0) || null;
       const replyTarget =
@@ -379,154 +522,45 @@ export function createServer({
             null
           : null;
       const nativeQuote = replyTarget?.quote || buildSyntheticQuote(threadId, replyTarget, replyTargetZaloMsgId, zaloClient.getSelfUid());
-
+      const queueItems = [] as Array<{ kind: "text" | "image" | "file"; text?: string; url?: string; fileName?: string; quote?: Record<string, unknown> | null; mentions?: typeof mentionsForZalo }>;
       if (hasText) {
-        tasks.push(
-          (async () => {
-            try {
-              const isGroup = threadId.startsWith("group:");
-              console.log("[chatwoot-callback] forward to Zalo", {
-                conversationId,
-                threadSource,
-                threadIdValidation: "accepted",
-                isGroup,
-                messageId: msg?.id,
-                normalized: (messageType === "template" && textForZalo !== trimmedContent) || finalTextForZalo !== textForZalo,
-                replyToId,
-                nativeQuote: !!nativeQuote,
-                syntheticQuote: !!nativeQuote && !replyTarget?.quote,
-                mentionCount: mentionsForZalo.length,
-              });
-              const msgId = await zaloClient.sendText(threadId, finalTextForZalo, nativeQuote, mentionsForZalo);
-              if (msgId) runtimeStatus.markOutboundZaloSend();
-              else runtimeStatus.setError("zalo_text_send_failed");
-              cache.addMany([msgId, cwTextKey(threadId, finalTextForZalo)]);
-              if (msgId && cwMessageId) {
-                const entry = {
-                  conversationId: conversationId || 0,
-                  cwId: cwMessageId,
-                  preview: finalTextForZalo.slice(0, 80),
-                  sender: "self",
-                } as const;
-                messageMap.set(String(msgId), entry);
-                messageStore?.set(String(msgId), entry);
-              }
-            } catch (err) {
-              runtimeStatus.setError("zalo_text_send_failed");
-              console.warn("[chatwoot-callback] text forward failed", {
-                threadSource,
-                isGroup: threadId.startsWith("group:"),
-                category: "text_forward_failed",
-              });
-            }
-          })(),
-        );
+        queueItems.push({ kind: "text", text: finalTextForZalo, quote: nativeQuote, mentions: mentionsForZalo });
       }
-
-      for (const att of attachments) {
-        if (!att.url) continue;
-        tasks.push(
-          (async () => {
-            console.log("[chatwoot-callback] attachment forward", {
-              threadSource,
-              type: att.fileType,
-            });
-            let contentLength: number | null = null;
-            let contentType: string | null = null;
-            try {
-              const head = await fetch(att.url, { method: "HEAD", signal: AbortSignal.timeout(15_000) });
-              if (!head.ok) {
-                runtimeStatus.setError("attachment_fetch_failed");
-                console.warn("[zalo-send-image-url-bad]", { category: "attachment_head_status", status: head.status });
-                return;
-              }
-              const len = head.headers.get("content-length");
-              if (len && !Number.isNaN(Number(len))) contentLength = Number(len);
-              contentType = head.headers.get("content-type");
-            } catch (err) {
-              runtimeStatus.setError("attachment_fetch_failed");
-              console.warn("[zalo-send-image-url-bad]", { category: "attachment_head_failed" });
-              return;
-            }
-            let filename = att.fileName || undefined;
-            if (!filename) {
-              try {
-                const last = new URL(att.url).pathname.split("/").pop() || "";
-                filename = last ? decodeURIComponent(last) : undefined;
-              } catch {
-                filename = undefined;
-              }
-            }
-            filename = sanitizeAttachmentFileName(filename);
-            console.log("[zalo-send-attachment]", {
-              type: att.fileType,
-              size: contentLength,
-              via: "buffer",
-              contentType,
-            });
-            if (filename) {
-              cache.add(attachmentEchoKey(threadId, filename));
-              cache.addWithTtl(recentAttachmentKey(threadId, filename), 60_000);
-            }
-
-            if (att.fileType === "image") {
-              const msgId = await zaloClient.sendImage(threadId, att.url, filename);
-              if (msgId) {
-                runtimeStatus.markOutboundZaloSend();
-                cache.addMany([msgId, filename ? attachmentEchoKey(threadId, filename) : null]);
-                if (cwMessageId) {
-                  const entry = {
-                    conversationId: conversationId || 0,
-                    cwId: cwMessageId,
-                    preview: "Image",
-                    sender: "self",
-                  } as const;
-                  messageMap.set(String(msgId), entry);
-                  messageStore?.set(String(msgId), entry);
-                }
-              } else if (!hasText) {
-                const fbText = `Image: ${att.url}`;
-                console.warn("[zalo-send-attachment-error]", { type: "image", category: "fallback_to_text" });
-                const fbMsgId = await zaloClient.sendText(threadId, fbText);
-                if (fbMsgId) runtimeStatus.markOutboundZaloSend();
-                else runtimeStatus.setError("zalo_fallback_send_failed");
-                cache.addMany([fbMsgId, contentKey(threadId, fbText)]);
-              } else {
-                runtimeStatus.setError("zalo_image_send_failed");
-              }
-            } else {
-              const msgId = await sendDocument(threadId, att.url, filename);
-              if (msgId) {
-                runtimeStatus.markOutboundZaloSend();
-                cache.addMany([msgId, filename ? attachmentEchoKey(threadId, filename) : null]);
-                if (cwMessageId) {
-                  const entry = {
-                    conversationId: conversationId || 0,
-                    cwId: cwMessageId,
-                    preview: "File",
-                    sender: "self",
-                  } as const;
-                  messageMap.set(String(msgId), entry);
-                  messageStore?.set(String(msgId), entry);
-                }
-              } else if (!hasText) {
-                const title = filename || "File";
-                const fbText = `Shared file: ${title}\n${att.url}`;
-                console.warn("[zalo-send-attachment-error]", { type: "file", category: "fallback_to_text" });
-                const fbMsgId = await zaloClient.sendText(threadId, fbText);
-                if (fbMsgId) runtimeStatus.markOutboundZaloSend();
-                else runtimeStatus.setError("zalo_fallback_send_failed");
-                cache.addMany([fbMsgId, contentKey(threadId, fbText)]);
-              } else {
-                runtimeStatus.setError("zalo_file_send_failed");
-              }
-            }
-          })(),
-        );
+      for (const attachment of attachments) {
+        queueItems.push({
+          kind: attachment.fileType === "image" ? "image" : "file",
+          url: attachment.url,
+          fileName: sanitizeAttachmentFileName(attachment.fileName),
+        });
       }
+      if (!queueItems.length) return res.json({ success: true, skipped: "empty_message" });
 
-      Promise.allSettled(tasks).catch(() => {});
-      return;
+      console.log("[chatwoot-callback] enqueue outbound message", {
+        threadSource,
+        itemCount: queueItems.length,
+        normalized: (messageType === "template" && textForZalo !== trimmedContent) || finalTextForZalo !== textForZalo,
+        nativeQuote: !!nativeQuote,
+        syntheticQuote: !!nativeQuote && !replyTarget?.quote,
+        mentionCount: mentionsForZalo.length,
+      });
+      let enqueueResult: { duplicate: boolean; key: string };
+      try {
+        enqueueResult = await outboundQueue.enqueue({
+          conversationId: normalizedConversationId,
+          messageId: cwMessageId,
+          threadId,
+          items: queueItems,
+        });
+      } catch (error) {
+        const category = error instanceof OutboundDeliveryError ? error.category : "outbound_queue_write_failed";
+        runtimeStatus.setError("outbound_queue_failed");
+        console.warn("[chatwoot-callback] outbound enqueue failed", { category });
+        return res.status(503).json({ success: false, error: "outbound_queue_unavailable" });
+      }
+      if (enqueueResult.duplicate) {
+        return res.json({ success: true, queued: false, duplicate: true });
+      }
+      return res.json({ success: true, queued: true });
     } catch (err) {
       runtimeStatus.setError("callback_processing_failed");
       console.error("[chatwoot-callback] error", { category: "callback_processing_failed" });

@@ -1,3 +1,4 @@
+import { installUploadConfirmationCoordinator } from "./uploadConfirmationCoordinator";
 import fs from "fs";
 import path from "path";
 import { Zalo, ThreadType, type Message, type Reaction, type Undo, type Credentials, type API } from "@warriorteam/zalo-personal";
@@ -151,7 +152,38 @@ type ZaloClientConfig = {
 };
 
 const MEDIA_FETCH_TIMEOUT_MS = 60_000;
+const ZALO_API_FETCH_TIMEOUT_MS = 120_000;
 const bridgeLogger = globalThis.console;
+
+export class ZaloApiFetchTimeoutError extends Error {
+  constructor() {
+    super("zalo_api_fetch_timeout");
+    this.name = "ZaloApiFetchTimeoutError";
+  }
+}
+
+export function isZaloApiFetchTimeout(error: unknown): boolean {
+  return error instanceof ZaloApiFetchTimeoutError ||
+    (error instanceof Error && error.message.includes("zalo_api_fetch_timeout"));
+}
+
+export function isZaloUploadConfirmationCooldown(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("zalo_upload_confirmation_cooldown");
+}
+
+export function isZaloUploadCallbackTimeout(error: unknown): boolean {
+  return error instanceof Error && error.message.includes("zalo_upload_callback_timeout");
+}
+
+const zaloApiFetch: typeof fetch = (input, init = {}) => {
+  const timeoutSignal = AbortSignal.timeout(ZALO_API_FETCH_TIMEOUT_MS);
+  const sourceSignal = init.signal ?? (input instanceof Request ? input.signal : undefined);
+  const signal = sourceSignal ? AbortSignal.any([sourceSignal, timeoutSignal]) : timeoutSignal;
+  return fetch(input, { ...init, signal }).catch((error: unknown) => {
+    if (timeoutSignal.aborted && !sourceSignal?.aborted) throw new ZaloApiFetchTimeoutError();
+    throw error;
+  });
+};
 
 type StoredSession = {
   imei?: string;
@@ -242,8 +274,9 @@ export class ZaloPersonalClient implements ZaloClient {
     const stored = await this.loadSession();
     const credentials = normalizeCredentials(this.config, stored);
     if (!this.api) {
-      const zalo = new Zalo({ selfListen: true, logging: false });
+      const zalo = new Zalo({ selfListen: true, logging: false, polyfill: zaloApiFetch });
       this.api = (await this.tryRestoreFromSavedContext(zalo, stored, credentials)) || (await zalo.login(credentials));
+      installUploadConfirmationCoordinator(this.api);
     }
     const accountInfo = await this.api.fetchAccountInfo();
     const provenUid = accountInfo?.profile?.userId;
@@ -327,23 +360,24 @@ export class ZaloPersonalClient implements ZaloClient {
       if (resp.ok) {
         const arr = await resp.arrayBuffer();
         const buf = Buffer.from(arr);
-        const msgId = await this.sendImageBuffer(threadId, buf, derivedName);
-        if (msgId) return msgId;
+        try {
+          // Once the SDK call begins, a missing response ID is ambiguous. Do not
+          // submit the same image again through the URL fallback.
+          return await this.sendImageBuffer(threadId, buf, derivedName);
+        } catch (error) {
+          if (isZaloApiFetchTimeout(error)) throw error;
+          bridgeLogger.warn("[zalo-send-attachment-error]", { type: "image", category: "provider_outcome_unknown" });
+          return null;
+        }
       }
       bridgeLogger.warn("[zalo-send-attachment-error]", {
         type: "image",
-        filename: derivedName,
-        url: imageUrl,
         status: resp.status,
-        message: "download_failed",
+        category: "download_failed",
       });
-    } catch (err) {
-      bridgeLogger.warn("[zalo-send-attachment-error]", {
-        type: "image",
-        filename: derivedName,
-        url: imageUrl,
-        message: (err as Error).message,
-      });
+    } catch (error) {
+      if (isZaloApiFetchTimeout(error)) throw error;
+      bridgeLogger.warn("[zalo-send-attachment-error]", { type: "image", category: "download_failed" });
     }
     // fallback to URL-based attachment (proper schema), if buffer path failed
     try {
@@ -358,13 +392,9 @@ export class ZaloPersonalClient implements ZaloClient {
       );
       const attachmentId = result?.attachment?.[0]?.msgId ?? null;
       return attachmentId ? String(attachmentId) : null;
-    } catch (err) {
-      bridgeLogger.warn("[zalo-send-attachment-error]", {
-        type: "image",
-        filename: derivedName,
-        url: imageUrl,
-        message: (err as Error).message,
-      });
+    } catch (error) {
+      if (isZaloApiFetchTimeout(error)) throw error;
+      bridgeLogger.warn("[zalo-send-attachment-error]", { type: "image", category: "provider_outcome_unknown" });
       return null;
     }
   }
@@ -454,29 +484,20 @@ export class ZaloPersonalClient implements ZaloClient {
           );
           const attachmentId = result?.attachment?.[0]?.msgId ?? null;
           return attachmentId ? String(attachmentId) : null;
-        } catch (err) {
-          bridgeLogger.warn("[zalo-send-attachment-error]", {
-            type: "file",
-            filename: derivedName,
-            url: fileUrl,
-            message: (err as Error).message,
-          });
+        } catch (error) {
+          if (isZaloApiFetchTimeout(error) || isZaloUploadCallbackTimeout(error) || isZaloUploadConfirmationCooldown(error)) throw error;
+          bridgeLogger.warn("[zalo-send-attachment-error]", { type: "file", category: "provider_outcome_unknown" });
+          return null;
         }
       }
       bridgeLogger.warn("[zalo-send-attachment-error]", {
         type: "file",
-        filename: derivedName,
-        url: fileUrl,
         status: resp.status,
-        message: "download_failed",
+        category: "download_failed",
       });
-    } catch (err) {
-      bridgeLogger.warn("[zalo-send-attachment-error]", {
-        type: "file",
-        filename: derivedName,
-        url: fileUrl,
-        message: (err as Error).message,
-      });
+    } catch (error) {
+      if (isZaloApiFetchTimeout(error) || isZaloUploadCallbackTimeout(error) || isZaloUploadConfirmationCooldown(error)) throw error;
+      bridgeLogger.warn("[zalo-send-attachment-error]", { type: "file", category: "download_failed" });
     }
     // fallback to URL-based attachment (proper schema)
     try {
@@ -491,13 +512,9 @@ export class ZaloPersonalClient implements ZaloClient {
       );
       const attachmentId = result?.attachment?.[0]?.msgId ?? null;
       return attachmentId ? String(attachmentId) : null;
-    } catch (err) {
-      bridgeLogger.warn("[zalo-send-attachment-error]", {
-        type: "file",
-        filename: derivedName,
-        url: fileUrl,
-        message: (err as Error).message,
-      });
+    } catch (error) {
+      if (isZaloApiFetchTimeout(error) || isZaloUploadCallbackTimeout(error) || isZaloUploadConfirmationCooldown(error)) throw error;
+      bridgeLogger.warn("[zalo-send-attachment-error]", { type: "file", category: "provider_outcome_unknown" });
       return null;
     }
   }
@@ -527,7 +544,7 @@ export class ZaloPersonalClient implements ZaloClient {
         bridgeLogger.log("[zalo-sticker-url-resolved]", { resolved: true });
         return url;
       }
-    } catch (err) {
+    } catch {
       bridgeLogger.warn("[zalo-sticker-error]", { category: "sticker_lookup_failed" });
     }
     return null;
@@ -626,13 +643,9 @@ export class ZaloPersonalClient implements ZaloClient {
         }
         if (!text) {
           bridgeLogger.log("[zalo-photo-raw]", {
-            msgId,
-            keys: Object.keys(data || {}),
-            contentKeys: Object.keys(contentObj || {}),
-            paramsKeys:
-              contentObj?.params && typeof contentObj.params === "object"
-                ? Object.keys(contentObj.params)
-                : undefined,
+            dataFieldCount: Object.keys(data || {}).length,
+            contentFieldCount: Object.keys(contentObj || {}).length,
+            hasParams: !!contentObj?.params && typeof contentObj.params === "object",
           });
         }
         break;
@@ -657,7 +670,10 @@ export class ZaloPersonalClient implements ZaloClient {
         mediaUrl = contentObj?.href || data.href || contentObj?.stickerUrl;
         stickerId = contentObj?.stickerId || contentObj?.sticker || contentObj?.id || msgId;
         fileName = contentObj?.stickerId ? `sticker-${contentObj.stickerId}.webp` : this.deriveFilename(mediaUrl, msgId, "webp");
-        bridgeLogger.log("[zalo-sticker-raw]", JSON.stringify(contentObj || content, null, 2));
+        bridgeLogger.log("[zalo-sticker-raw]", {
+          hasStickerId: !!stickerId,
+          hasMediaUrl: !!mediaUrl,
+        });
         break;
       default:
         type = "text";
@@ -770,7 +786,7 @@ export class ZaloPersonalClient implements ZaloClient {
       await (api as any).fetchAccountInfo?.();
       bridgeLogger.log("[zalo-personal-bridge] restored API from saved session context");
       return api;
-    } catch (err) {
+    } catch {
       bridgeLogger.warn("[zalo-personal-bridge] failed to restore saved context", {
         category: "session_restore_failed",
       });
@@ -782,11 +798,11 @@ export class ZaloPersonalClient implements ZaloClient {
     if (!this.api || !uid) return null;
     const cached = this.profileCache.get(uid);
     if (cached && cached.exp > Date.now()) {
-      bridgeLogger.log("[zalo-profile-cache-hit]", { uid });
+      bridgeLogger.log("[zalo-profile-cache-hit]");
       return { displayName: cached.displayName, avatarUrl: cached.avatarUrl };
     }
     try {
-      bridgeLogger.log("[zalo-profile-fetch]", { uid });
+      bridgeLogger.log("[zalo-profile-fetch]");
       const info = await (this.api as any).getUserInfo?.(uid);
       if (!info) return null;
       if (!this.profileLogged.has(uid)) {
@@ -794,23 +810,7 @@ export class ZaloPersonalClient implements ZaloClient {
         try {
           const raw = info as any;
           bridgeLogger.log("[zalo-profile-raw]", {
-            uid,
-            rawKeys: Object.keys(raw || {}),
-            avatarCandidates: {
-              avatar: raw?.avatar,
-              avatarUrl: raw?.avatarUrl,
-              avatar_url: raw?.avatar_url,
-              userAvatar: raw?.userAvatar,
-              thumbnail: raw?.thumbnail,
-              thumb: raw?.thumb,
-              picture: raw?.picture,
-            },
-            displayNameCandidates: {
-              displayName: raw?.displayName,
-              name: raw?.name,
-              fullname: raw?.fullname,
-              userName: raw?.userName,
-            },
+            fieldCount: Object.keys(raw || {}).length,
           });
         } catch {
           // ignore
@@ -842,8 +842,8 @@ export class ZaloPersonalClient implements ZaloClient {
         undefined;
       this.profileCache.set(uid, { displayName, avatarUrl, exp: Date.now() + 30 * 60 * 1000 });
       return { displayName, avatarUrl };
-    } catch (err) {
-      bridgeLogger.warn("[zalo-profile-error]", { uid, message: (err as Error)?.message });
+    } catch {
+      bridgeLogger.warn("[zalo-profile-error]", { category: "profile_fetch_failed" });
       return null;
     }
   }
@@ -878,7 +878,7 @@ export class ZaloPersonalClient implements ZaloClient {
       };
       await fs.promises.mkdir(path.dirname(this.config.sessionFile), { recursive: true });
       await fs.promises.writeFile(this.config.sessionFile, JSON.stringify(payload, null, 2), "utf8");
-    } catch (err) {
+    } catch {
       bridgeLogger.warn("[zalo-personal-bridge] failed to persist session", {
         category: "session_persist_failed",
       });
@@ -912,13 +912,16 @@ export class ZaloPersonalClient implements ZaloClient {
       const picked = pickFrom(info) || pickFrom(info?.group) || pickFrom(info?.info);
       if (picked?.name || picked?.avatarUrl) {
         this.groupCache.set(threadId, { ...picked, exp: Date.now() + 30 * 60_000 });
-        bridgeLogger.log("[zalo-group-info]", { threadId, name: picked.name || null, hasAvatar: !!picked.avatarUrl });
+        bridgeLogger.log("[zalo-group-info]", {
+          hasName: !!picked.name,
+          hasAvatar: !!picked.avatarUrl,
+        });
         return picked;
       }
       this.groupCache.set(threadId, { name: undefined, avatarUrl: undefined, exp: Date.now() + 10 * 60_000 });
       return null;
-    } catch (err) {
-      bridgeLogger.warn("[zalo-group-info-error]", { threadId, message: (err as Error).message });
+    } catch {
+      bridgeLogger.warn("[zalo-group-info-error]", { category: "group_info_fetch_failed" });
       return null;
     }
   }

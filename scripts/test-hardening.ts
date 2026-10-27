@@ -1,3 +1,4 @@
+import { OutboundDeliveryQueue } from "../src/outboundDeliveryQueue";
 import assert from "assert";
 import type { AddressInfo } from "net";
 import { buildNativeAgentMessageBody } from "../src/chatwootClient";
@@ -120,6 +121,7 @@ async function main() {
     } as any,
     cache: { has: () => false, add: () => {}, addMany: () => {}, addWithTtl: () => {} } as any,
     inboxId: 1,
+    outboundQueue: new OutboundDeliveryQueue(),
     threadMap: new Map(),
     messageMap: new Map(),
     runtimeStatus: status,
