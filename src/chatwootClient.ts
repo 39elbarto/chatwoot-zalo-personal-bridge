@@ -112,6 +112,28 @@ export class ChatwootClient {
     return { status: res.status, body, text };
   }
 
+  async markOutboundFailed(conversationId: number, messageId: number, externalError: string): Promise<void> {
+    const endpoint = `/api/v1/accounts/${this.cfg.accountId}/conversations/${conversationId}/messages/${messageId}`;
+    const result = await this.request(endpoint, {
+      method: "PATCH",
+      headers: this.headers(),
+      body: JSON.stringify({ status: "failed", external_error: externalError }),
+    }, "outbound status update");
+    const message = responseObject(result.body)?.data ?? result.body;
+    if (message?.status !== "failed" || message?.content_attributes?.external_error !== externalError) {
+      throw new Error("chatwoot_status_update_unconfirmed");
+    }
+  }
+
+  async getMessageForRetry(conversationId: number, messageId: number): Promise<Record<string, any> | null> {
+    const endpoint = `/api/v1/accounts/${this.cfg.accountId}/conversations/${conversationId}/messages?after=${messageId}&before=${messageId + 1}`;
+    const result = await this.request(endpoint, { headers: this.headers() }, "outbound retry read");
+    const messages = result.body?.payload;
+    if (!Array.isArray(messages)) throw new Error("chatwoot_retry_read_invalid");
+    const matches = messages.filter((message: any) => message?.id === messageId);
+    return matches.length === 1 ? matches[0] : null;
+  }
+
   private extractId(payload: any): number | null {
     if (!payload) return null;
     if (typeof payload.id === "number") return payload.id;

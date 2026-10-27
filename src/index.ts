@@ -1,6 +1,7 @@
 import dotenv from "dotenv";
 import { ChatwootClient } from "./chatwootClient";
 import { ZaloPersonalClient } from "./zaloClient";
+import { OutboundDeliveryQueue } from "./outboundDeliveryQueue";
 import { OutgoingCache } from "./outgoingCache";
 import { createServer } from "./server";
 import { contentKey } from "./messageKeys";
@@ -37,6 +38,7 @@ const ZALO_USER_AGENT = process.env.ZALO_USER_AGENT || "";
 const ZALO_LANGUAGE = process.env.ZALO_LANGUAGE || "vi";
 const ZALO_COOKIE_JSON = process.env.ZALO_COOKIE_JSON || "";
 const ZALO_SESSION_FILE = process.env.ZALO_SESSION_FILE || "./data/session.json";
+const ZALO_OUTBOUND_QUEUE_FILE = process.env.ZALO_OUTBOUND_QUEUE_FILE || "./data/outbound-queue/queue.json";
 const ZALO_MENTIONS_CONFIG_FILE = process.env.ZALO_MENTIONS_CONFIG_FILE || "./data/zalo-mentions.json";
 const ZALO_EXPECTED_SELF_UID = process.env.ZALO_EXPECTED_SELF_UID || "";
 const ZALO_LISTENER_RECOVERY_TIMEOUT_RAW = process.env.ZALO_LISTENER_RECOVERY_TIMEOUT_MS;
@@ -62,6 +64,10 @@ async function bootstrap() {
   const messageStore = new MessageMapStore();
   const runtimeStatus = new RuntimeStatus({ accountId: CHATWOOT_ACCOUNT_ID, inboxId: CHATWOOT_INBOX_ID });
   runtimeStatus.setAccountState(resolveAccountIdentityState(ZALO_EXPECTED_SELF_UID, null));
+  const outboundQueue = new OutboundDeliveryQueue({
+    filePath: ZALO_OUTBOUND_QUEUE_FILE,
+    onStorageError: () => runtimeStatus.setError("outbound_queue_failed"),
+  });
 
   const rawChatwootClient = new ChatwootClient({
     baseUrl: CHATWOOT_BASE_URL,
@@ -119,6 +125,7 @@ async function bootstrap() {
     threadMap,
     messageMap,
     messageStore,
+    outboundQueue,
     mentionsConfigFile: ZALO_MENTIONS_CONFIG_FILE,
     runtimeStatus,
     routePrefixes: HTTP_ROUTE_PREFIXES.split(",").map((prefix) => prefix.trim()).filter(Boolean),
@@ -161,6 +168,14 @@ async function bootstrap() {
       category: "configuration_invalid",
       field: "ZALO_LISTENER_RECOVERY_TIMEOUT_MS",
     });
+    return;
+  }
+
+  try {
+    await outboundQueue.load();
+  } catch {
+    runtimeStatus.setError("outbound_queue_failed");
+    console.error("[zalo-personal-bridge] startup blocked", { category: "outbound_queue_storage_initialization_failed" });
     return;
   }
 
@@ -1397,14 +1412,17 @@ async function bootstrap() {
         listenerRecovery.connected();
         runtimeStatus.markZaloConnected();
         runtimeStatus.markListenerStarted();
+        if (runtimeStatus.isReady()) outboundQueue.start();
       },
       onDisconnected: (code, reason) => {
+        outboundQueue.pause();
         runtimeStatus.markListenerStopped();
         runtimeStatus.markZaloDisconnected();
         runtimeStatus.setError("listener_disconnected");
         listenerRecovery.unavailable("disconnected", code, reason);
       },
       onError: () => {
+        outboundQueue.pause();
         runtimeStatus.markListenerStopped();
         runtimeStatus.markZaloDisconnected();
         runtimeStatus.setError("listener_error");

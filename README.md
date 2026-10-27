@@ -135,3 +135,31 @@ npm view axios dotenv express form-data jsqr pngjs qrcode-terminal license
 ```
 
 The key legal risk is not package license compatibility; it is the unofficial Zalo Personal API posture described above.
+
+### Outbound attachment confirmation
+
+The bridge pins `@warriorteam/zalo-personal` to 1.4.1 and checks the SDK's
+upload and listener interfaces at startup. The bridge-owned coordinator waits
+for the matching `file_done` event before the SDK may submit a file message;
+HTTP upload success alone is not confirmation. The former install-time SDK mutation is retired; the adapter also supports
+installations where that legacy timeout patch is already present.
+A missing confirmation is bounded, and late callbacks cannot continue a rejected
+upload. After an unidentifiable interrupted upload, file uploads are explicitly refused
+for five minutes before their HTTP request begins. Observed file IDs are also
+held for five minutes; a reused ID is refused when identified, so an old callback
+cannot confirm a later upload. Chatwoot reports the cooldown and allows a safe
+retry after it expires.
+
+The queue retries a pre-submission callback timeout once without replaying
+accepted items. A generic SDK fetch timeout has an unknown outcome and is not
+replayed automatically. Failed or partial terminal jobs are reported to the
+Chatwoot message as failed, with an attachment-specific explanation when
+applicable; feedback retries do not resend Zalo content. Feedback for new jobs is persisted before sending, retried a few times and
+reconsidered after restart until acknowledged. Older jobs are not backfilled.
+Native Chatwoot retry reads the current message before requeueing only failed,
+known pre-submission attachments; accepted items are never replayed. Unknown
+outcomes are not retried and are reported as failed again. A restart during a
+queued or in-flight retry leaves its outcome unknown instead of replaying it.
+SDK acceptance does not establish recipient delivery.
+
+Set `ZALO_OUTBOUND_QUEUE_FILE` to change the private durable queue path. Its default is `./data/outbound-queue/queue.json`. Keep queue data out of Git and preserve it during deployments.
