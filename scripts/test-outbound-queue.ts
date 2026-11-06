@@ -386,6 +386,65 @@ async function testMissingProviderIdDoesNotDoubleSubmit() {
   }
 }
 
+async function testCapacityAndRetention(root: string) {
+  const queuePath = path.join(root, "capacity", "queue.json");
+  await fs.mkdir(path.dirname(queuePath), { recursive: true });
+  const now = Date.now();
+  const jobs = Array.from({ length: 2_000 }, (_, index) => ({
+    key: `cw:90:${index + 1}`, conversationId: 90, messageId: index + 1, threadId: "fixture",
+    items: [{ index: 0, kind: "text", state: "accepted", attempts: 1, zaloMessageId: `fixture-${index}`, text: "fixture" }],
+    state: "complete", createdAt: now, updatedAt: now, completedAt: now,
+  }));
+  await fs.writeFile(queuePath, JSON.stringify({ version: 1, jobs }));
+  const queue = new OutboundDeliveryQueue({ filePath: queuePath, logger: testLogger([]) });
+  await queue.load();
+  assert.equal(queue.healthSummary().can_accept_new, true, "completed history must not block new work at 2000");
+  assert.equal((await queue.enqueue({ conversationId: 90, messageId: 1, threadId: "fixture", items: [{ kind: "text", text: "fixture" }] })).duplicate, true);
+  assert.equal((await queue.enqueue({ conversationId: 90, messageId: 2001, threadId: "fixture", items: [{ kind: "text", text: "fixture" }] })).duplicate, false);
+  const reloaded = new OutboundDeliveryQueue({ filePath: queuePath, logger: testLogger([]) });
+  await reloaded.load();
+  assert.equal((await reloaded.enqueue({ conversationId: 90, messageId: 1, threadId: "fixture", items: [{ kind: "text", text: "fixture" }] })).duplicate, true, "deduplication must survive restart");
+
+  const fullJobs = Array.from({ length: 10_000 }, (_, index) => ({ ...jobs[index % jobs.length], key: `cw:91:${index + 1}`, conversationId: 91, messageId: index + 1 }));
+  fullJobs[9999] = { ...fullJobs[9999], state: "partial", items: [{ index: 0, kind: "text", state: "unknown", attempts: 1, zaloMessageId: "fixture", text: "fixture" }] };
+  await fs.writeFile(queuePath, JSON.stringify({ version: 1, jobs: fullJobs }));
+  const full = new OutboundDeliveryQueue({ filePath: queuePath, logger: testLogger([]) });
+  await full.load();
+  assert.equal(full.healthSummary().capacity_exhausted, true);
+  await assert.rejects(full.enqueue({ conversationId: 91, messageId: 10001, threadId: "fixture", items: [{ kind: "text", text: "fixture" }] }), /outbound_queue_full/);
+  const app = createServer(makeServerDeps(full, []));
+  const { server, base } = await listen(app);
+  try {
+    const response = await fetch(`${base}/health`, { signal: AbortSignal.timeout(5_000) });
+    assert.equal(response.status, 503);
+    assert.equal((await response.json() as any).outbound_queue.capacity_exhausted, true);
+  } finally { await new Promise<void>((resolve) => server.close(() => resolve())); }
+
+  fullJobs[0].completedAt = now - 31 * 24 * 60 * 60 * 1000;
+  await fs.writeFile(queuePath, JSON.stringify({ version: 1, jobs: fullJobs }));
+  const expired = new OutboundDeliveryQueue({ filePath: queuePath, logger: testLogger([]) });
+  await expired.load();
+  assert.equal(expired.healthSummary().can_accept_new, true, "expired completed history can be pruned");
+  await expired.enqueue({ conversationId: 91, messageId: 10001, threadId: "fixture", items: [{ kind: "text", text: "fixture" }] });
+  assert.equal(expired.snapshot().length, 10_000);
+  assert.equal(expired.snapshot().find((job) => job.messageId === 10000)?.state, "partial", "uncertain outcomes must be retained");
+  assert.equal((await expired.enqueue({ conversationId: 91, messageId: 2, threadId: "fixture", items: [{ kind: "text", text: "fixture" }] })).duplicate, true, "unexpired history must remain deduplicated");
+
+  const activeJobs = jobs.map((job) => ({ ...job, state: "queued", items: [{ index: 0, kind: "text", state: "queued", attempts: 0, text: "fixture" }] }));
+  await fs.writeFile(queuePath, JSON.stringify({ version: 1, jobs: activeJobs }));
+  const active = new OutboundDeliveryQueue({ filePath: queuePath, logger: testLogger([]) });
+  await active.load();
+  assert.equal(active.healthSummary().active_jobs, 2_000);
+  assert.equal(active.healthSummary().capacity_exhausted, true);
+  await assert.rejects(active.enqueue({ conversationId: 92, messageId: 1, threadId: "fixture", items: [{ kind: "text", text: "fixture" }] }), /outbound_queue_full/);
+  const retryJob = { ...jobs[0], key: "cw:92:2", conversationId: 92, messageId: 2, state: "partial", statusFeedback: { state: "acknowledged", retryGeneration: 0 }, items: [{ index: 0, kind: "file", state: "failed", attempts: 1, failureCategory: "attachment_head_failed", url: "https://fixture.invalid" }] };
+  await fs.writeFile(queuePath, JSON.stringify({ version: 1, jobs: [...activeJobs, retryJob] }));
+  const activeRetry = new OutboundDeliveryQueue({ filePath: queuePath, logger: testLogger([]) });
+  await activeRetry.load();
+  assert.equal(await activeRetry.applyNativeRetry(92, 2, 0), "reassert", "retry must not exceed active capacity");
+  assert.equal(activeRetry.snapshot().find((job) => job.key === "cw:92:2")?.state, "partial");
+}
+
 async function main() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "zalo-outbound-queue-test-"));
   try {
@@ -398,6 +457,7 @@ async function main() {
   await testUploadCallbackTimeoutRetriesOnce(root);
     await testInterruptedUploadCallbackRetryIsNotReplayed(root);
     await testMissingProviderIdDoesNotDoubleSubmit();
+    await testCapacityAndRetention(root);
     console.log("[test:outbound-queue] ok");
   } finally {
     await fs.rm(root, { recursive: true, force: true });

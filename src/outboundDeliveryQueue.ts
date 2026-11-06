@@ -43,6 +43,10 @@ export type OutboundQueueHealthSummary = {
   terminal_issue_count: number;
   oldest_pending_seconds: number;
   issue_fingerprint: string;
+  stored_jobs: number;
+  active_jobs: number;
+  capacity_exhausted: boolean;
+  can_accept_new: boolean;
 };
 
 export type OutboundQueueJob = {
@@ -82,8 +86,8 @@ export class OutboundDeliveryError extends Error {
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAYS_MS = [1_000, 5_000];
 const COMPLETED_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
-const MAX_COMPLETED_JOBS = 5_000;
-const MAX_TOTAL_JOBS = 2_000;
+const MAX_ACTIVE_JOBS = 2_000;
+const MAX_TOTAL_JOBS = 10_000;
 
 function messageKey(input: Pick<OutboundJobInput, "conversationId" | "messageId">): string {
   return `cw:${input.conversationId}:${input.messageId}`;
@@ -287,7 +291,9 @@ export class OutboundDeliveryQueue {
 
       const now = Date.now();
       this.pruneCompleted(now);
-      if (this.jobs.length >= MAX_TOTAL_JOBS) throw new OutboundDeliveryError("outbound_queue_full", "retryable");
+      if (this.jobs.length >= MAX_TOTAL_JOBS || this.jobs.filter((job) => job.state === "queued" || job.state === "sending").length >= MAX_ACTIVE_JOBS) {
+        throw new OutboundDeliveryError("outbound_queue_full", "retryable");
+      }
       const job: OutboundQueueJob = {
         key,
         conversationId: input.conversationId,
@@ -348,7 +354,8 @@ export class OutboundDeliveryQueue {
           job.statusFeedback.retryGeneration !== expectedGeneration) return { result: "ignored" as const, job: null };
       const safeCategories = new Set(["zalo_upload_callback_timeout", "zalo_upload_confirmation_cooldown", "attachment_head_failed", "attachment_head_status", "attachment_url_missing"]);
       const failures = job.items.filter((item) => item.state === "failed");
-      const unsafe = job.items.some((item) => item.state === "unknown") || failures.length === 0 ||
+      const unsafe = this.jobs.filter((candidate) => candidate.state === "queued" || candidate.state === "sending").length >= MAX_ACTIVE_JOBS ||
+        job.items.some((item) => item.state === "unknown") || failures.length === 0 ||
         failures.some((item) => !safeCategories.has(item.failureCategory || "") ||
           (item.kind === "text" ? typeof item.text !== "string" : typeof item.url !== "string"));
       job.statusFeedback.retryGeneration++;
@@ -411,11 +418,16 @@ export class OutboundDeliveryQueue {
       terminal_issue_count: 0,
       oldest_pending_seconds: 0,
       issue_fingerprint: "",
+      stored_jobs: this.jobs.length,
+      active_jobs: 0,
+      capacity_exhausted: false,
+      can_accept_new: false,
     };
     const issueSignatures: string[] = [];
     let oldestPendingAt = now;
 
     for (const job of this.jobs) {
+      if (job.state === "queued" || job.state === "sending") summary.active_jobs += 1;
       for (const item of job.items) {
         summary[item.state] += 1;
         if (item.state === "queued" || item.state === "sending") {
@@ -427,6 +439,10 @@ export class OutboundDeliveryQueue {
         }
       }
     }
+
+    const retainedJobs = this.jobs.filter((job) => job.state !== "complete" || !job.completedAt || now - job.completedAt <= COMPLETED_RETENTION_MS).length;
+    summary.capacity_exhausted = retainedJobs >= MAX_TOTAL_JOBS || summary.active_jobs >= MAX_ACTIVE_JOBS;
+    summary.can_accept_new = !this.halted && !summary.capacity_exhausted;
 
     if (summary.pending_count > 0) {
       summary.oldest_pending_seconds = Math.max(0, Math.floor((now - oldestPendingAt) / 1000));
@@ -601,12 +617,6 @@ export class OutboundDeliveryQueue {
       if (job.state !== "complete" || !job.completedAt) return true;
       return now - job.completedAt <= COMPLETED_RETENTION_MS;
     });
-    const completed = this.jobs.filter((job) => job.state === "complete");
-    const excess = completed.length - MAX_COMPLETED_JOBS;
-    if (excess > 0) {
-      const remove = new Set(completed.sort((a, b) => (a.completedAt || 0) - (b.completedAt || 0)).slice(0, excess));
-      this.jobs = this.jobs.filter((job) => !remove.has(job));
-    }
   }
 
   private async persist(): Promise<void> {
