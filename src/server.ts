@@ -327,7 +327,9 @@ export function createServer({
 
   const healthHandler = (_req: express.Request, res: express.Response) => {
     const health = runtimeStatus.health();
-    return res.status(health.ok ? 200 : 503).json({ ...health, outbound_queue: outboundQueue.healthSummary() });
+    const queue = outboundQueue.healthSummary();
+    const ok = health.ok && queue.can_accept_new;
+    return res.status(ok ? 200 : 503).json({ ...health, ok, outbound_queue: queue });
   };
   const normalizedRoutePrefixes = normalizeRoutePrefixes(routePrefixes);
   for (const path of ["/health", ...normalizedRoutePrefixes.map((prefix) => `${prefix}/health`)]) {
