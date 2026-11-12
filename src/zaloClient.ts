@@ -1,3 +1,4 @@
+import { safeZaloError } from "./safeZaloError";
 import { installUploadConfirmationCoordinator } from "./uploadConfirmationCoordinator";
 import fs from "fs";
 import path from "path";
@@ -275,7 +276,12 @@ export class ZaloPersonalClient implements ZaloClient {
     const credentials = normalizeCredentials(this.config, stored);
     if (!this.api) {
       const zalo = new Zalo({ selfListen: true, logging: false, polyfill: zaloApiFetch });
-      this.api = (await this.tryRestoreFromSavedContext(zalo, stored, credentials)) || (await zalo.login(credentials));
+      try {
+        this.api = (await this.tryRestoreFromSavedContext(zalo, stored, credentials)) || (await zalo.login(credentials));
+      } catch (error) {
+        bridgeLogger.warn("[zalo-auth-diagnostic]", { stage: "saved_credentials_login", ...safeZaloError(error) });
+        throw error;
+      }
       installUploadConfirmationCoordinator(this.api);
     }
     const accountInfo = await this.api.fetchAccountInfo();
@@ -786,9 +792,9 @@ export class ZaloPersonalClient implements ZaloClient {
       await (api as any).fetchAccountInfo?.();
       bridgeLogger.log("[zalo-personal-bridge] restored API from saved session context");
       return api;
-    } catch {
+    } catch (error) {
       bridgeLogger.warn("[zalo-personal-bridge] failed to restore saved context", {
-        category: "session_restore_failed",
+        category: "session_restore_failed", ...safeZaloError(error),
       });
       return null;
     }
