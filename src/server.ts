@@ -8,6 +8,8 @@ import { ZaloMentionResolver } from "./zaloMentions";
 import type { RuntimeStatus } from "./runtimeStatus";
 import { OutboundDeliveryError, OutboundDeliveryQueue, type OutboundQueueJob, type OutboundQueueItem } from "./outboundDeliveryQueue";
 
+import { safeZaloError } from "./safeZaloError";
+
 export type ServerDeps = {
   chatwootClient: ChatwootClient;
   zaloClient: ZaloClient;
@@ -234,6 +236,10 @@ export function createServer({
       try {
         zaloMessageId = await zaloClient.sendText(job.threadId, text, item.quote, item.mentions);
       } catch (error) {
+        console.warn("[zalo-text-send-diagnostic]", {
+          result: "sdk_exception", group: job.threadId.startsWith("group:"),
+          ...safeZaloError(error), fetch_timeout: isZaloApiFetchTimeout(error),
+        });
         runtimeStatus.setError("zalo_text_send_failed");
         if (isZaloApiFetchTimeout(error)) {
           throw new OutboundDeliveryError("zalo_api_fetch_timeout", "unknown");
@@ -241,6 +247,9 @@ export function createServer({
         throw new OutboundDeliveryError("zalo_text_outcome_unknown", "unknown");
       }
       if (!zaloMessageId) {
+        console.warn("[zalo-text-send-diagnostic]", {
+          result: "missing_message_id", group: job.threadId.startsWith("group:"),
+        });
         runtimeStatus.setError("zalo_text_send_failed");
         throw new OutboundDeliveryError("zalo_text_outcome_unknown", "unknown");
       }
